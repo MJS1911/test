@@ -1,6 +1,0 @@
-name = "mf-server-panel"
-compatibility_date = "2024-01-01"
-pages_build_output_dir = "."
-
-[vars]
-API_BASE_URL = "https://www.heyunidc.cn/v1/"
