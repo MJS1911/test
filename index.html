@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>魔方财务 - 服务器管理面板 (Cloudflare Pages)</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <!-- 顶部导航栏 -->
+    <header class="topbar">
+        <div class="topbar-inner">
+            <span class="logo">🖥️ 魔方财务 · 服务器管理</span>
+            <span class="topbar-status" id="topbarStatus">未连接</span>
+        </div>
+    </header>
+
+    <!-- 主容器 -->
+    <div class="container">
+
+        <!-- 左侧：登录 & 配置面板 -->
+        <aside class="sidebar" id="sidebar">
+            <div class="panel">
+                <h2>🔑 API 配置</h2>
+                <div class="form-group">
+                    <label for="apiBaseUrl">目标站点</label>
+                    <input type="text" id="apiBaseUrl" placeholder="https://www.heyunidc.cn/v1/" value="https://www.heyunidc.cn/v1/">
+                    <small class="form-hint">此版本通过 Cloudflare Functions 代理请求，无需本地代理。目标站点地址用于记录，实际请求走 <code>/api/*</code> 路径。</small>
+                </div>
+                <div class="form-group">
+                    <label for="account">账号</label>
+                    <input type="text" id="account" placeholder="手机号或邮箱">
+                </div>
+                <div class="form-group">
+                    <label for="apiKey">API 密钥</label>
+                    <input type="password" id="apiKey" placeholder="API Key（非登录密码）">
+                </div>
+                <button class="btn btn-primary btn-block" id="btnLogin" onclick="doLogin()">🔓 登录</button>
+                <button class="btn btn-outline btn-block" id="btnLogout" onclick="doLogout()" style="display:none;">🔒 登出</button>
+                <div class="login-msg" id="loginMsg"></div>
+            </div>
+
+            <div class="panel" id="panelBatch" style="display:none;">
+                <h2>⚡ 批量操作</h2>
+                <div class="batch-buttons">
+                    <button class="btn btn-success btn-sm" onclick="batchOperation('on')">全部开机</button>
+                    <button class="btn btn-warning btn-sm" onclick="batchOperation('off')">全部关机</button>
+                    <button class="btn btn-danger btn-sm" onclick="batchOperation('hard_reboot')">全部硬重启</button>
+                    <button class="btn btn-info btn-sm" onclick="batchOperation('reboot')">全部重启</button>
+                </div>
+                <div class="batch-buttons" style="margin-top:8px;">
+                    <button class="btn btn-outline btn-sm" onclick="batchOperation('hard_off')">全部硬关机</button>
+                    <button class="btn btn-outline btn-sm" onclick="refreshAllStatus()">刷新全部状态</button>
+                </div>
+                <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
+                    <button class="btn btn-outline btn-sm btn-block" onclick="openChangePassword()">🔑 修改管理密码</button>
+                </div>
+            </div>
+        </aside>
+
+        <!-- 右侧：服务器列表 -->
+        <main class="main-content">
+            <div class="panel">
+                <div class="panel-header">
+                    <h2>📋 服务器列表</h2>
+                    <div class="panel-header-right">
+                        <span class="server-count" id="serverCount">共 0 台</span>
+                        <button class="btn btn-sm btn-outline" id="btnRefresh" onclick="loadServers()" disabled>🔄 刷新列表</button>
+                    </div>
+                </div>
+
+                <!-- 加载中 -->
+                <div class="loading" id="loadingArea" style="display:none;">
+                    <div class="spinner"></div>
+                    <p>正在加载服务器列表...</p>
+                </div>
+
+                <!-- 空状态 -->
+                <div class="empty-state" id="emptyState">
+                    <p>👆 请先在左侧配置 API 信息并登录</p>
+                </div>
+
+                <!-- 服务器表格 -->
+                <div class="table-wrapper" id="tableWrapper" style="display:none;">
+                    <table class="server-table" id="serverTable">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>产品名称</th>
+                                <th>域名/IP</th>
+                                <th>主IP</th>
+                                <th>状态</th>
+                                <th>到期时间</th>
+                                <th>金额</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="serverTbody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- 操作确认弹窗 -->
+    <div class="modal-overlay" id="modalOverlay" style="display:none;">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="modalTitle">确认操作</h3>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="modalBody"></div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" onclick="closeModal()">取消</button>
+                <button class="btn btn-primary" id="modalConfirmBtn" onclick="confirmOperation()">确认执行</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 管理密码验证弹窗 -->
+    <div class="modal-overlay" id="adminVerifyOverlay" style="display:flex;">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>🔐 管理密码验证</h3>
+            </div>
+            <div class="modal-body">
+                <p style="margin-bottom:12px;">请输入管理密码以访问服务器管理面板</p>
+                <div class="form-group">
+                    <input type="password" id="adminPasswordInput" placeholder="请输入管理密码" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:6px;font-size:1rem;">
+                </div>
+                <div class="login-msg" id="adminVerifyMsg"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary btn-block" id="btnAdminVerify" onclick="verifyAdminPassword()">验证</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 修改管理密码弹窗 -->
+    <div class="modal-overlay" id="changePasswordOverlay" style="display:none;">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>🔑 修改管理密码</h3>
+                <button class="modal-close" onclick="closeChangePassword()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="oldPasswordInput">原密码</label>
+                    <input type="password" id="oldPasswordInput" placeholder="请输入原密码">
+                </div>
+                <div class="form-group">
+                    <label for="newPasswordInput">新密码</label>
+                    <input type="password" id="newPasswordInput" placeholder="请输入新密码（至少6位）">
+                </div>
+                <div class="form-group">
+                    <label for="confirmPasswordInput">确认新密码</label>
+                    <input type="password" id="confirmPasswordInput" placeholder="请再次输入新密码">
+                </div>
+                <div class="login-msg" id="changePasswordMsg"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" onclick="closeChangePassword()">取消</button>
+                <button class="btn btn-primary" id="btnChangePassword" onclick="changeAdminPassword()">确认修改</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast 通知 -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <!-- 系统日志窗口 -->
+    <div class="log-panel" id="logPanel">
+        <div class="log-header">
+            <span class="log-title">📋 系统日志</span>
+            <div class="log-controls">
+                <button type="button" class="btn btn-sm btn-outline" onclick="clearLogs()">清空</button>
+                <button type="button" class="btn btn-sm btn-outline" onclick="toggleLogPanel()">收起</button>
+            </div>
+        </div>
+        <div class="log-content" id="logContent"></div>
+    </div>
+
+    <script src="js/api.js"></script>
+    <script src="js/ui.js"></script>
+    <script src="js/operations.js"></script>
+</body>
+</html>
