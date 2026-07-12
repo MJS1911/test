@@ -60,7 +60,7 @@ async function doLogin() {
     showLoginMsg('正在登录...', '');
 
     try {
-        const result = await loginAPI(account, apiKey);
+        const result = await loginAPI(account, apiKey, baseUrl);
         if (result.success) {
             showLoginMsg('✅ 登录成功！', 'success');
             // 登录成功后保存凭证到 KV

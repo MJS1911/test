@@ -53,21 +53,34 @@ export async function onRequest(context) {
   }
   
   // ========== 常规 API 代理转发 ==========
-  // 从 KV 读取用户配置的 baseUrl（登录时保存），支持多平台切换
-  // 优先级: KV存储的用户配置 > 环境变量 API_BASE_URL > 默认值
+  // 多平台支持：优先级顺序
+  // 1. 请求头 X-Target-Base（登录时前端传入，首次登录 KV 为空时使用）
+  // 2. KV 存储的用户配置（登录成功后保存，后续请求使用）
+  // 3. 环境变量 API_BASE_URL（Cloudflare Pages 设置）
+  // 4. 默认值
   let targetApiBase = env.API_BASE_URL || 'https://www.heyunidc.cn/v1/';
   let provisionApiBase = 'https://www.heyunidc.cn/';
+
+  // 优先读取请求头中的目标平台地址（登录时前端传入）
+  const targetBaseHeader = request.headers.get('X-Target-Base');
+  if (targetBaseHeader) {
+    targetApiBase = targetBaseHeader;
+    try {
+      const parsed = new URL(targetBaseHeader);
+      provisionApiBase = parsed.origin + '/';
+    } catch (e) {
+      console.warn('X-Target-Base 格式无效:', targetBaseHeader);
+    }
+  }
   
-  if (env.AUTH_KV) {
+  // 其次从 KV 读取（登录成功后保存的配置）
+  if (!targetBaseHeader && env.AUTH_KV) {
     try {
       const authRaw = await env.AUTH_KV.get('auth_credentials');
       if (authRaw) {
         const authData = JSON.parse(authRaw);
         if (authData.baseUrl) {
-          // 用户配置了 baseUrl，用它来推导目标地址
           targetApiBase = authData.baseUrl;
-          // 从 baseUrl 推导 provision 基础地址（去掉路径部分，只保留协议+域名）
-          // 例如: https://www.heyunidc.cn/v1/ -> https://www.heyunidc.cn/
           const parsed = new URL(authData.baseUrl);
           provisionApiBase = parsed.origin + '/';
         }

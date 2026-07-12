@@ -127,16 +127,23 @@ async function apiRequest(url, options = {}) {
 /**
  * 使用账号和 API 密钥登录，获取 JWT Token
  */
-async function loginAPI(account, apiKey) {
+async function loginAPI(account, apiKey, baseUrl) {
     const url = apiUrl('login_api');
 
     const params = new URLSearchParams();
     params.append('account', account);
     params.append('password', apiKey);
 
-    log('info', '登录请求', 'account=' + account);
+    // 传递目标平台地址给代理，通过自定义头
+    const extraHeaders = {};
+    if (baseUrl) {
+        extraHeaders['X-Target-Base'] = baseUrl;
+    }
+
+    log('info', '登录请求', 'account=' + account + ' baseUrl=' + (baseUrl || '默认'));
     const result = await apiRequest(url, {
         method: 'POST',
+        headers: extraHeaders,
         body: params.toString(),
     });
 
