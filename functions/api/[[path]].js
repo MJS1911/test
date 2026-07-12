@@ -53,24 +53,42 @@ export async function onRequest(context) {
   }
   
   // ========== 常规 API 代理转发 ==========
-  // 从环境变量获取目标 API 基础地址
-  // 在 Cloudflare Pages 设置中添加环境变量: API_BASE_URL = https://www.heyunidc.cn/v1/
-  const TARGET_API_BASE = env.API_BASE_URL || 'https://www.heyunidc.cn/v1/';
-  // provision 接口不在 /v1/ 下，直接在根域名
-  const PROVISION_API_BASE = 'https://www.heyunidc.cn/';
+  // 从 KV 读取用户配置的 baseUrl（登录时保存），支持多平台切换
+  // 优先级: KV存储的用户配置 > 环境变量 API_BASE_URL > 默认值
+  let targetApiBase = env.API_BASE_URL || 'https://www.heyunidc.cn/v1/';
+  let provisionApiBase = 'https://www.heyunidc.cn/';
+  
+  if (env.AUTH_KV) {
+    try {
+      const authRaw = await env.AUTH_KV.get('auth_credentials');
+      if (authRaw) {
+        const authData = JSON.parse(authRaw);
+        if (authData.baseUrl) {
+          // 用户配置了 baseUrl，用它来推导目标地址
+          targetApiBase = authData.baseUrl;
+          // 从 baseUrl 推导 provision 基础地址（去掉路径部分，只保留协议+域名）
+          // 例如: https://www.heyunidc.cn/v1/ -> https://www.heyunidc.cn/
+          const parsed = new URL(authData.baseUrl);
+          provisionApiBase = parsed.origin + '/';
+        }
+      }
+    } catch (e) {
+      console.warn('读取 KV 配置失败，使用默认值:', e);
+    }
+  }
 
   // 获取请求路径，去掉 /api 前缀 (url 已在上面声明)
   const search = url.search;
 
   // 构建目标 URL
-  // 注意：TARGET_API_BASE 以 /v1/ 结尾，path 是 /login_api 这样的绝对路径
+  // 注意：targetApiBase 以 /v1/ 结尾，path 是 /login_api 这样的绝对路径
   // new URL('/login_api', 'https://xxx/v1/') 会变成 https://xxx/login_api（丢失 /v1/）
   // 所以需要去掉 path 开头的 /，让它变成相对路径拼接
   const relativePath = path.replace(/^\//, '');
   
   // provision 接口使用根域名，其他接口使用 /v1/
   const isProvision = relativePath.startsWith('provision/');
-  const targetBase = isProvision ? PROVISION_API_BASE : TARGET_API_BASE;
+  const targetBase = isProvision ? provisionApiBase : targetApiBase;
   const targetUrl = new URL(relativePath + search, targetBase);
 
   // 复制请求头
