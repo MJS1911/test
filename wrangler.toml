@@ -1,0 +1,11 @@
+name = "mf-server-panel"
+compatibility_date = "2024-01-01"
+pages_build_output_dir = "."
+
+[vars]
+API_BASE_URL = "https://www.heyunidc.cn/v1/"
+
+[[kv_namespaces]]
+binding = "AUTH_KV"
+id = "你的KV命名空间ID"
+preview_id = "你的预览环境KV命名空间ID"

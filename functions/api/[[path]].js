@@ -61,7 +61,11 @@ export async function onRequest(context) {
   const search = url.search;
   
   // 构建目标 URL
-  const targetUrl = new URL(path + search, TARGET_API_BASE);
+  // 注意：TARGET_API_BASE 以 /v1/ 结尾，path 是 /login_api 这样的绝对路径
+  // new URL('/login_api', 'https://xxx/v1/') 会变成 https://xxx/login_api（丢失 /v1/）
+  // 所以需要去掉 path 开头的 /，让它变成相对路径拼接
+  const relativePath = path.replace(/^\//, '');
+  const targetUrl = new URL(relativePath + search, TARGET_API_BASE);
   
   // 复制请求头
   const headers = new Headers(request.headers);
