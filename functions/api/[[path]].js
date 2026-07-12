@@ -56,24 +56,30 @@ export async function onRequest(context) {
   // 从环境变量获取目标 API 基础地址
   // 在 Cloudflare Pages 设置中添加环境变量: API_BASE_URL = https://www.heyunidc.cn/v1/
   const TARGET_API_BASE = env.API_BASE_URL || 'https://www.heyunidc.cn/v1/';
-  
+  // provision 接口不在 /v1/ 下，直接在根域名
+  const PROVISION_API_BASE = 'https://www.heyunidc.cn/';
+
   // 获取请求路径，去掉 /api 前缀 (url 已在上面声明)
   const search = url.search;
-  
+
   // 构建目标 URL
   // 注意：TARGET_API_BASE 以 /v1/ 结尾，path 是 /login_api 这样的绝对路径
   // new URL('/login_api', 'https://xxx/v1/') 会变成 https://xxx/login_api（丢失 /v1/）
   // 所以需要去掉 path 开头的 /，让它变成相对路径拼接
   const relativePath = path.replace(/^\//, '');
-  const targetUrl = new URL(relativePath + search, TARGET_API_BASE);
   
+  // provision 接口使用根域名，其他接口使用 /v1/
+  const isProvision = relativePath.startsWith('provision/');
+  const targetBase = isProvision ? PROVISION_API_BASE : TARGET_API_BASE;
+  const targetUrl = new URL(relativePath + search, targetBase);
+
   // 复制请求头
   const headers = new Headers(request.headers);
-  
+
   // 移除可能导致问题的头部
   headers.delete('host');
   headers.delete('content-length');
-  
+
   // 关键：从 Authorization: Bearer <jwt> 提取 JWT，设置为 Cookie
   // 魔方财务 provision 接口要求 Cookie: ZJMF_8F073A284ADDCA6A=<jwt>
   const authHeader = headers.get('authorization');
@@ -81,18 +87,18 @@ export async function onRequest(context) {
     const jwt = authHeader.substring(7);
     headers.set('Cookie', `ZJMF_8F073A284ADDCA6A=${jwt}`);
   }
-  
+
   // 设置 Origin 和 Referer 为目标域名，满足魔方财务的 Referer/Origin 校验
-  const targetOrigin = new URL(TARGET_API_BASE).origin;
+  const targetOrigin = new URL(targetBase).origin;
   headers.set('Origin', targetOrigin);
   headers.set('Referer', targetOrigin + '/');
-  
+
   // 设置 User-Agent 模拟浏览器
   headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   headers.set('X-Requested-With', 'XMLHttpRequest');
   headers.set('Accept', '*/*');
   headers.set('Accept-Language', 'zh-CN,zh;q=0.8,en;q=0.7');
-  
+
   // 构建转发请求
   const proxyRequest = new Request(targetUrl.toString(), {
     method: request.method,
@@ -100,14 +106,14 @@ export async function onRequest(context) {
     body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : undefined,
     redirect: 'follow',
   });
-  
+
   try {
     // 发起请求到目标 API
     const response = await fetch(proxyRequest);
-    
+
     // 创建响应头，添加 CORS 头
     const responseHeaders = new Headers(response.headers);
-    
+
     // 关键：添加 CORS 头，允许前端跨域访问
     const origin = request.headers.get('Origin') || '*';
     responseHeaders.set('Access-Control-Allow-Origin', origin);
@@ -115,11 +121,11 @@ export async function onRequest(context) {
     responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
     responseHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Origin, Referer, Accept, Accept-Language, Cookie');
     responseHeaders.set('Access-Control-Expose-Headers', 'Set-Cookie');
-    
+
     // 移除可能导致问题的头部
     responseHeaders.delete('content-security-policy');
     responseHeaders.delete('x-frame-options');
-    
+
     // 返回响应
     return new Response(response.body, {
       status: response.status,
