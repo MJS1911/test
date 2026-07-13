@@ -3,41 +3,56 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>魔方财务 - 服务器管理面板 (Cloudflare Pages)</title>
+    <title>魔方财务 - 服务器管理面板</title>
     <link rel="stylesheet" href="css/style.css">
 </head>
 <body class="index-page">
-    <!-- 顶部导航栏 -->
+    <!-- 顶部标签导航栏 -->
     <header class="topbar">
         <div class="topbar-inner">
-            <span class="logo">🖥️ 魔方财务 · 服务器管理</span>
-            <span class="topbar-status" id="topbarStatus">未连接</span>
+            <div class="topbar-left">
+                <span class="logo">🖥️ 魔方财务</span>
+                <div class="topbar-tabs-area" id="providerTabsArea">
+                    <!-- JS 动态生成服务商标签 -->
+                </div>
+                <button class="tab-add-btn" id="btnAddProvider" title="添加服务商" onclick="openAddProviderModal()">+</button>
+            </div>
+            <div class="topbar-right">
+                <span class="topbar-status" id="topbarStatus">未连接</span>
+                <div class="topbar-user-menu">
+                    <button class="topbar-user-btn" id="userMenuBtn" onclick="toggleUserMenu()">
+                        <span>👤</span> <span id="displayName">管理员</span> <span>▼</span>
+                    </button>
+                    <div class="user-dropdown" id="userDropdown">
+                        <button class="user-dropdown-item" onclick="openChangePasswordDialog();toggleUserMenu();">🔑 修改管理密码</button>
+                        <div class="user-dropdown-divider"></div>
+                        <button class="user-dropdown-item" onclick="toggleUserMenu();logoutSite();">🚪 退出登录</button>
+                    </div>
+                </div>
+            </div>
         </div>
     </header>
 
     <!-- 主容器 -->
-    <div class="container">
+    <div class="container" id="mainContainer">
+        <!-- 无服务商时的欢迎面板 -->
+        <div class="welcome-panel" id="welcomePanel" style="display:none;">
+            <div class="panel" style="text-align:center;padding:60px 20px;grid-column:1/-1;">
+                <div style="font-size:4rem;margin-bottom:16px;">🖥️</div>
+                <h2 style="margin-bottom:12px;">欢迎使用多服务商管理面板</h2>
+                <p style="color:var(--text-muted);margin-bottom:24px;">点击顶部 <strong>+</strong> 按钮添加您的第一个服务商</p>
+                <button class="btn btn-primary" onclick="openAddProviderModal()">+ 添加服务商</button>
+            </div>
+        </div>
 
-        <!-- 左侧：登录 & 配置面板 -->
-        <aside class="sidebar" id="sidebar">
-            <div class="panel">
-                <h2>🔑 API 配置</h2>
-                <div class="form-group">
-                    <label for="apiBaseUrl">目标站点</label>
-                    <input type="text" id="apiBaseUrl" placeholder="https://www.heyunidc.cn/v1/" value="https://www.heyunidc.cn/v1/">
-                    <small class="form-hint">支持任意魔方财务站点。输入目标站点地址（如 <code>https://www.heyunidc.cn/v1/</code>），系统会自动适配。登录后凭证和站点地址会保存到云端。</small>
+        <!-- 有服务商时的主布局 -->
+        <aside class="sidebar" id="sidebar" style="display:none;">
+            <div class="panel" id="panelProviderInfo">
+                <h2>📋 当前服务商</h2>
+                <div id="activeProviderInfo">
+                    <p style="color:var(--text-muted);">未选择服务商</p>
                 </div>
-                <div class="form-group">
-                    <label for="account">账号</label>
-                    <input type="text" id="account" placeholder="手机号或邮箱">
-                </div>
-                <div class="form-group">
-                    <label for="apiKey">API 密钥</label>
-                    <input type="password" id="apiKey" placeholder="API Key（非登录密码）">
-                </div>
-                <button class="btn btn-primary btn-block" id="btnLogin" onclick="doLogin()">🔓 登录</button>
-                <button class="btn btn-outline btn-block" id="btnLogout" onclick="doLogout()" style="display:none;">🔒 登出</button>
-                <div class="login-msg" id="loginMsg"></div>
+                <button class="btn btn-outline btn-block" style="margin-top:12px;" id="btnDisconnect" onclick="disconnectProvider()" disabled>🔒 断开连接</button>
             </div>
 
             <div class="panel" id="panelBatch" style="display:none;">
@@ -59,7 +74,7 @@
         </aside>
 
         <!-- 右侧：服务器列表 -->
-        <main class="main-content">
+        <main class="main-content" id="mainContent" style="display:none;">
             <div class="panel">
                 <div class="panel-header">
                     <h2>📋 服务器列表</h2>
@@ -77,7 +92,7 @@
 
                 <!-- 空状态 -->
                 <div class="empty-state" id="emptyState">
-                    <p>👆 请先在左侧配置 API 信息并登录</p>
+                    <p>👆 请先选择服务商并登录</p>
                 </div>
 
                 <!-- 服务器表格 -->
@@ -113,6 +128,44 @@
             <div class="modal-footer">
                 <button class="btn btn-outline" onclick="closeModal()">取消</button>
                 <button class="btn btn-primary" id="modalConfirmBtn" onclick="confirmOperation()">确认执行</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 添加服务商弹窗 -->
+    <div class="modal-overlay" id="addProviderModal" style="display:none;">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="addProviderTitle">添加服务商</h3>
+                <button class="modal-close" onclick="closeAddProviderModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="newProviderName">服务商名称 *</label>
+                    <input type="text" id="newProviderName" placeholder="如：鹤云IDC、XX云">
+                </div>
+                <div class="form-group">
+                    <label for="newProviderUrl">API 地址 *</label>
+                    <input type="text" id="newProviderUrl" placeholder="https://www.heyunidc.cn/v1/">
+                    <small class="form-hint">目标魔方财务站点 API 地址</small>
+                </div>
+                <div class="form-group">
+                    <label for="newProviderAccount">账号 *</label>
+                    <input type="text" id="newProviderAccount" placeholder="手机号或邮箱">
+                </div>
+                <div class="form-group">
+                    <label for="newProviderApiKey">API 密钥 *</label>
+                    <input type="password" id="newProviderApiKey" placeholder="API Key（非登录密码）">
+                </div>
+                <div class="form-group">
+                    <label for="newProviderNotes">备注</label>
+                    <input type="text" id="newProviderNotes" placeholder="可选备注">
+                </div>
+                <div class="login-msg" id="addProviderMsg"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" onclick="closeAddProviderModal()">取消</button>
+                <button class="btn btn-primary" id="btnSaveProvider" onclick="saveNewProvider()">保存并连接</button>
             </div>
         </div>
     </div>
@@ -184,5 +237,361 @@
     <script src="js/adminAuth.js"></script>
     <script src="js/ui.js"></script>
     <script src="js/operations.js"></script>
+    <script>
+    // ==================== 服务商标签栏管理 ====================
+
+    // 本地服务商缓存
+    let providerList = [];
+    let activePid = null;
+
+    /** 从 API 加载服务商列表 */
+    async function loadProviderList() {
+        try {
+            const resp = await fetch('/api/provider/list');
+            const result = await resp.json();
+            if (result.success) {
+                providerList = result.data || [];
+                activePid = result.activeId || null;
+                renderProviderTabs();
+                updateLayoutForProviders();
+            }
+        } catch(e) {
+            console.error('加载服务商列表失败:', e);
+        }
+    }
+
+    /** 渲染顶部标签栏 */
+    function renderProviderTabs() {
+        const area = document.getElementById('providerTabsArea');
+        if (!area) return;
+        let html = '';
+        providerList.forEach(p => {
+            const isActive = p.id === activePid;
+            html += '<div class="provider-tab' + (isActive ? ' active' : '') + '" ' +
+                'data-id="' + escapeHtml(p.id) + '" ' +
+                'onclick="switchProvider(\'' + escapeHtml(p.id) + '\')">' +
+                '<span class="tab-name">' + escapeHtml(p.name || '未命名') + '</span>' +
+                '<span class="tab-close" onclick="event.stopPropagation();deleteProviderTab(\'' + escapeHtml(p.id) + '\')" title="删除">×</span>' +
+                '</div>';
+        });
+        area.innerHTML = html;
+    }
+
+    /** 根据服务商数量切换布局 */
+    function updateLayoutForProviders() {
+        const welcomePanel = document.getElementById('welcomePanel');
+        const sidebar = document.getElementById('sidebar');
+        const mainContent = document.getElementById('mainContent');
+        const mainContainer = document.getElementById('mainContainer');
+
+        if (providerList.length === 0) {
+            // 无服务商：显示欢迎面板
+            if (welcomePanel) welcomePanel.style.display = 'block';
+            if (sidebar) sidebar.style.display = 'none';
+            if (mainContent) mainContent.style.display = 'none';
+            if (mainContainer) mainContainer.style.gridTemplateColumns = '1fr';
+        } else {
+            // 有服务商：显示侧边栏+主内容
+            if (welcomePanel) welcomePanel.style.display = 'none';
+            if (sidebar) sidebar.style.display = 'flex';
+            if (mainContent) mainContent.style.display = 'block';
+            if (mainContainer) mainContainer.style.gridTemplateColumns = '320px 1fr';
+            updateActiveProviderInfo();
+        }
+    }
+
+    /** 更新侧边栏当前服务商信息 */
+    function updateActiveProviderInfo() {
+        const infoEl = document.getElementById('activeProviderInfo');
+        const btnDisconnect = document.getElementById('btnDisconnect');
+        const panelBatch = document.getElementById('panelBatch');
+        const topbarStatus = document.getElementById('topbarStatus');
+
+        if (!activePid) {
+            if (infoEl) infoEl.innerHTML = '<p style="color:var(--text-muted);">未选择服务商</p>';
+            if (btnDisconnect) btnDisconnect.disabled = true;
+            if (panelBatch) panelBatch.style.display = 'none';
+            if (topbarStatus) { topbarStatus.textContent = '未连接'; topbarStatus.className = 'topbar-status'; }
+            return;
+        }
+
+        const p = providerList.find(x => x.id === activePid);
+        if (!p) return;
+
+        if (infoEl) {
+            infoEl.innerHTML =
+                '<div style="margin-bottom:8px;"><strong>' + escapeHtml(p.name) + '</strong></div>' +
+                '<div style="font-size:0.8rem;color:var(--text-muted);word-break:break-all;">' + escapeHtml(p.url) + '</div>' +
+                '<div style="font-size:0.8rem;color:var(--text-muted);">账号: ' + escapeHtml(p.account || '-') + '</div>';
+        }
+        if (btnDisconnect) btnDisconnect.disabled = false;
+        if (panelBatch) panelBatch.style.display = 'block';
+        if (topbarStatus) { topbarStatus.textContent = p.name + ' · 已连接'; topbarStatus.className = 'topbar-status connected'; }
+
+        // 恢复 DOM 引用（ui.js 中的 login 相关 DOM 需要适配）
+        updateLoginFields(p);
+    }
+
+    /** 切换服务商 */
+    async function switchProvider(pid) {
+        if (pid === activePid) return;
+        try {
+            const resp = await fetch('/api/provider/active', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: pid })
+            });
+            const result = await resp.json();
+            if (result.success) {
+                providerList = result.data || providerList;
+                activePid = result.activeId || pid;
+                renderProviderTabs();
+                updateActiveProviderInfo();
+                // 重新登录并加载服务器
+                await autoRelogin();
+                showToast('已切换到: ' + (providerList.find(p => p.id === pid) || {}).name, 'success');
+            } else {
+                showToast('切换失败: ' + (result.error || '未知错误'), 'error');
+            }
+        } catch(e) {
+            showToast('网络异常', 'error');
+        }
+    }
+
+    /** 删除服务商标签 */
+    async function deleteProviderTab(pid) {
+        const p = providerList.find(x => x.id === pid);
+        if (!p) return;
+        if (!confirm('确定要删除服务商「' + p.name + '」吗？\n此操作不可恢复。')) return;
+
+        try {
+            const resp = await fetch('/api/provider/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: pid })
+            });
+            const result = await resp.json();
+            if (result.success) {
+                providerList = result.data || [];
+                activePid = result.activeId || null;
+                renderProviderTabs();
+                updateLayoutForProviders();
+                if (activePid) {
+                    await autoRelogin();
+                } else {
+                    // 清理服务器列表
+                    clearServerList();
+                }
+                showToast('服务商已删除', 'success');
+            } else {
+                showToast('删除失败: ' + (result.error || '未知错误'), 'error');
+            }
+        } catch(e) {
+            showToast('网络异常', 'error');
+        }
+    }
+
+    /** 打开新增服务商弹窗 */
+    function openAddProviderModal() {
+        document.getElementById('addProviderTitle').textContent = '添加服务商';
+        document.getElementById('newProviderName').value = '';
+        document.getElementById('newProviderUrl').value = '';
+        document.getElementById('newProviderAccount').value = '';
+        document.getElementById('newProviderApiKey').value = '';
+        document.getElementById('newProviderNotes').value = '';
+        document.getElementById('addProviderMsg').textContent = '';
+        document.getElementById('addProviderMsg').className = 'login-msg';
+        document.getElementById('addProviderModal').style.display = 'flex';
+    }
+
+    /** 关闭新增服务商弹窗 */
+    function closeAddProviderModal() {
+        document.getElementById('addProviderModal').style.display = 'none';
+    }
+
+    /** 保存新服务商 */
+    async function saveNewProvider() {
+        const name = document.getElementById('newProviderName').value.trim();
+        const url = document.getElementById('newProviderUrl').value.trim();
+        const account = document.getElementById('newProviderAccount').value.trim();
+        const apiKey = document.getElementById('newProviderApiKey').value.trim();
+        const notes = document.getElementById('newProviderNotes').value.trim();
+        const msgEl = document.getElementById('addProviderMsg');
+        const btnEl = document.getElementById('btnSaveProvider');
+
+        if (!name) { msgEl.textContent = '请输入服务商名称'; msgEl.className = 'login-msg error'; return; }
+        if (!url) { msgEl.textContent = '请输入 API 地址'; msgEl.className = 'login-msg error'; return; }
+        if (!account) { msgEl.textContent = '请输入账号'; msgEl.className = 'login-msg error'; return; }
+        if (!apiKey) { msgEl.textContent = '请输入 API 密钥'; msgEl.className = 'login-msg error'; return; }
+
+        const providerData = {
+            id: 'pv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8),
+            name, url, account, apiKey, notes,
+            createdAt: Math.floor(Date.now() / 1000)
+        };
+
+        btnEl.disabled = true;
+        msgEl.textContent = '正在保存...';
+        msgEl.className = 'login-msg';
+
+        try {
+            const resp = await fetch('/api/provider/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(providerData)
+            });
+            const result = await resp.json();
+            if (result.success) {
+                providerList = result.data || [];
+                activePid = result.activeId || providerData.id;
+                closeAddProviderModal();
+                renderProviderTabs();
+                updateLayoutForProviders();
+                // 自动登录新服务商
+                await autoRelogin();
+                showToast('服务商已添加并连接', 'success');
+            } else {
+                msgEl.textContent = '❌ ' + (result.error || '保存失败');
+                msgEl.className = 'login-msg error';
+                showToast(result.error || '保存失败', 'error');
+            }
+        } catch(e) {
+            msgEl.textContent = '❌ 网络异常';
+            msgEl.className = 'login-msg error';
+        }
+        btnEl.disabled = false;
+    }
+
+    /** 断开当前服务商 */
+    function disconnectProvider() {
+        API.jwt = null;
+        API.hosts = [];
+        API.statusCache = {};
+        activePid = null;
+        renderProviderTabs();
+        updateLayoutForProviders();
+        clearServerList();
+        document.getElementById('topbarStatus').textContent = '未连接';
+        document.getElementById('topbarStatus').className = 'topbar-status';
+        showToast('已断开连接', 'info');
+    }
+
+    /** 自动重新登录当前活跃服务商 */
+    async function autoRelogin() {
+        clearServerList();
+        if (!activePid) return;
+        const p = providerList.find(x => x.id === activePid);
+        if (!p) return;
+
+        try {
+            const resp = await fetch('/api/provider/auto-login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: activePid })
+            });
+            const result = await resp.json();
+            if (result.success && result.jwt) {
+                API.jwt = result.jwt;
+                API.baseUrl = '/api/';
+                updateLoginFieldsForProvider(p);
+                await loadServers();
+            } else {
+                showToast('自动登录失败: ' + (result.error || '未知错误'), 'error');
+            }
+        } catch(e) {
+            showToast('自动登录异常: ' + e.message, 'error');
+        }
+    }
+
+    /** 更新 UI 中的登录信息字段 */
+    function updateLoginFields(p) {
+        // 兼容旧版 ui.js 的 DOM 引用
+        const urlEl = document.getElementById('apiBaseUrl');
+        const accountEl = document.getElementById('account');
+        const keyEl = document.getElementById('apiKey');
+        if (urlEl) urlEl.value = p.url || '';
+        if (accountEl) accountEl.value = p.account || '';
+        if (keyEl) keyEl.value = p.apiKey || '';
+    }
+
+    function updateLoginFieldsForProvider(p) {
+        updateLoginFields(p);
+    }
+
+    /** 清空服务器列表 */
+    function clearServerList() {
+        const tbody = document.getElementById('serverTbody');
+        const emptyState = document.getElementById('emptyState');
+        const tableWrapper = document.getElementById('tableWrapper');
+        const serverCount = document.getElementById('serverCount');
+        const btnRefresh = document.getElementById('btnRefresh');
+        if (tbody) tbody.innerHTML = '';
+        if (emptyState) emptyState.style.display = 'block';
+        if (tableWrapper) tableWrapper.style.display = 'none';
+        if (serverCount) serverCount.textContent = '共 0 台';
+        if (btnRefresh) btnRefresh.disabled = true;
+    }
+
+    /** 用户菜单切换 */
+    function toggleUserMenu() {
+        const dropdown = document.getElementById('userDropdown');
+        if (dropdown) dropdown.classList.toggle('show');
+        // 点击其他地方关闭
+        if (dropdown.classList.contains('show')) {
+            setTimeout(() => {
+                document.addEventListener('click', closeUserMenuOnClickOutside);
+            }, 0);
+        }
+    }
+
+    function closeUserMenuOnClickOutside(e) {
+        const menu = document.getElementById('userDropdown');
+        const btn = document.getElementById('userMenuBtn');
+        if (menu && !menu.contains(e.target) && e.target !== btn && !btn.contains(e.target)) {
+            menu.classList.remove('show');
+            document.removeEventListener('click', closeUserMenuOnClickOutside);
+        }
+    }
+
+    /** HTML 转义 */
+    function escapeHtml(str) {
+        if (!str) return '';
+        return String(str).replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>').replace(/"/g,'"').replace(/'/g,'&#39;');
+    }
+
+    /** 简单 Toast（用于服务商操作） */
+    function showToast(msg, type) {
+        const container = document.getElementById('toastContainer');
+        if (!container) return;
+        const icons = { success: '✅', error: '❌', warning: '⚠️', info: 'ℹ️' };
+        const div = document.createElement('div');
+        div.className = 'toast ' + (type || 'info');
+        div.innerHTML = '<span class="toast-icon">' + (icons[type] || 'ℹ️') + '</span>' +
+            '<span class="toast-message">' + escapeHtml(msg) + '</span>' +
+            '<button class="toast-close" onclick="this.parentElement.remove()">×</button>';
+        container.appendChild(div);
+        setTimeout(() => { if (div.parentElement) div.remove(); }, 3000);
+    }
+
+    /** 弹窗遮罩点击关闭 */
+    document.getElementById('addProviderModal').addEventListener('click', function(e) {
+        if (e.target === this) closeAddProviderModal();
+    });
+
+    // ==================== 启动流程 ====================
+    async function initApp() {
+        await loadProviderList();
+
+        // 如果已有活跃服务商，自动连接
+        if (activePid) {
+            await autoRelogin();
+        }
+    }
+
+    // 启动应用
+    document.addEventListener('DOMContentLoaded', function() {
+        initApp();
+    });
+    </script>
 </body>
 </html>

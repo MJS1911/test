@@ -14,6 +14,7 @@
  * 路由: /api/provider/save -> 保存（新增/编辑）服务商
  * 路由: /api/provider/delete -> 删除服务商
  * 路由: /api/provider/active -> 设置活跃服务商
+ * 路由: /api/provider/auto-login -> 自动登录服务商（服务端代理登录获取 JWT）
  * 
  * 部署后可用地址: https://<your-project>.pages.dev/api/*
  * 
@@ -76,6 +77,9 @@ export async function onRequest(context) {
   }
   if (path === '/provider/active' || path === '/provider/active/') {
     return handleProviderActive(context);
+  }
+  if (path === '/provider/auto-login' || path === '/provider/auto-login/') {
+    return handleProviderAutoLogin(context);
   }
   
   // ========== 常规 API 代理转发 ==========
@@ -750,6 +754,137 @@ async function handleProviderActive(context) {
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     });
   } catch (error) {
+    return new Response(JSON.stringify({ success: false, error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+}
+
+/**
+ * 自动登录服务商（服务端代理登录获取 JWT）
+ * POST /api/provider/auto-login
+ * Body: { id: "provider_id" }
+ * 响应: { success: true, jwt: "..." }
+ */
+async function handleProviderAutoLogin(context) {
+  const { request, env } = context;
+
+  if (!env.AUTH_KV) {
+    return new Response(JSON.stringify({ success: false, error: 'KV 存储未配置' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+
+  try {
+    const body = await request.json();
+    const { id } = body;
+
+    if (!id) {
+      return new Response(JSON.stringify({ success: false, error: '缺少服务商 ID' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    // 查找服务商
+    const providers = await getProviders(env);
+    const provider = providers.find(p => p.id === id);
+    if (!provider) {
+      return new Response(JSON.stringify({ success: false, error: '服务商不存在' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    if (!provider.account || !provider.apiKey) {
+      return new Response(JSON.stringify({ success: false, error: '服务商缺少登录凭证（账号/API密钥）' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    // 构建目标登录 URL
+    // provider.url 格式: https://xxx.com/v1/ 或 https://xxx.com/
+    let baseUrl = provider.url;
+    if (!baseUrl.endsWith('/')) baseUrl += '/';
+    const loginUrl = new URL('login_api', baseUrl).toString();
+
+    console.log('auto-login: 尝试登录服务商', provider.name, 'at', loginUrl);
+
+    // 构建登录请求体 (application/x-www-form-urlencoded)
+    const formBody = new URLSearchParams();
+    formBody.append('account', provider.account);
+    formBody.append('password', provider.apiKey);
+
+    // 设置请求头（模拟魔方财务前端请求）
+    const headers = new Headers();
+    headers.set('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
+    headers.set('Accept', '*/*');
+    headers.set('Accept-Language', 'zh-CN,zh;q=0.8,en;q=0.7');
+    headers.set('X-Requested-With', 'XMLHttpRequest');
+    headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+    // 设置 Origin 和 Referer
+    const targetOrigin = new URL(baseUrl).origin;
+    headers.set('Origin', targetOrigin);
+    headers.set('Referer', targetOrigin + '/');
+
+    const loginReq = new Request(loginUrl, {
+      method: 'POST',
+      headers: headers,
+      body: formBody.toString(),
+      redirect: 'follow',
+    });
+
+    const loginResp = await fetch(loginReq);
+    const loginData = await loginResp.json();
+
+    console.log('auto-login: 登录响应状态', loginResp.status, 'data keys:', Object.keys(loginData));
+
+    // 魔方财务 login_api 返回格式: { status: 200, info: { jwt: "..." } }
+    // 也可能是简化格式: { status: 200, jwt: "..." }
+    let jwt = null;
+    if (loginData.status === 200) {
+      // 优先从 info.jwt 提取
+      if (loginData.info && loginData.info.jwt) {
+        jwt = loginData.info.jwt;
+      } else if (loginData.jwt) {
+        jwt = loginData.jwt;
+      } else if (loginData.data && loginData.data.jwt) {
+        jwt = loginData.data.jwt;
+      }
+    }
+
+    if (jwt) {
+      // 同时保存当前服务商的 baseUrl 到 KV，确保后续 API 代理能正确路由
+      try {
+        const authData = {
+          account: provider.account,
+          apiKey: provider.apiKey,
+          baseUrl: provider.url,
+          updatedAt: new Date().toISOString()
+        };
+        await env.AUTH_KV.put('auth_credentials', JSON.stringify(authData));
+      } catch (kvErr) {
+        console.warn('auto-login: KV 保存失败（不影响登录）:', kvErr);
+      }
+
+      return new Response(JSON.stringify({ success: true, jwt }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    } else {
+      const errMsg = loginData.msg || loginData.info?.msg || loginData.message || '登录失败，未获取到 JWT';
+      console.error('auto-login: 登录失败', loginData);
+      return new Response(JSON.stringify({ success: false, error: errMsg }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+  } catch (error) {
+    console.error('auto-login error:', error);
     return new Response(JSON.stringify({ success: false, error: error.message }), {
       status: 500,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }

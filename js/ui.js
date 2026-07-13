@@ -43,6 +43,11 @@ const DOM = {
 // ==================== 登录/登出 ====================
 
 async function doLogin() {
+    // 兼容新架构：如果表单元素不存在则跳过
+    if (!DOM.apiBaseUrl || !DOM.account || !DOM.apiKey) {
+        console.log('[UI] doLogin: 表单元素不存在，使用 provider 自动登录');
+        return;
+    }
     const baseUrl = DOM.apiBaseUrl.value.trim();
     const account = DOM.account.value.trim();
     const apiKey = DOM.apiKey.value.trim();
@@ -56,7 +61,7 @@ async function doLogin() {
     // 但保留输入框以便用户知道配置的是哪个站点
     API.baseUrl = '/api/';
 
-    DOM.btnLogin.disabled = true;
+    if (DOM.btnLogin) DOM.btnLogin.disabled = true;
     showLoginMsg('正在登录...', '');
 
     try {
@@ -73,20 +78,19 @@ async function doLogin() {
         showLoginMsg('❌ ' + e.message, 'error');
     }
 
-    DOM.btnLogin.disabled = false;
+    if (DOM.btnLogin) DOM.btnLogin.disabled = false;
 }
 
 function onLoginSuccess() {
     // 切换 UI 状态
-    DOM.btnLogin.style.display = 'none';
-    DOM.btnLogout.style.display = 'block';
-    DOM.panelBatch.style.display = 'block';
-    DOM.btnRefresh.disabled = false;
-    DOM.emptyState.style.display = 'none';
+    if (DOM.btnLogin) DOM.btnLogin.style.display = 'none';
+    if (DOM.btnLogout) DOM.btnLogout.style.display = 'block';
+    if (DOM.panelBatch) DOM.panelBatch.style.display = 'block';
+    if (DOM.btnRefresh) DOM.btnRefresh.disabled = false;
+    if (DOM.emptyState) DOM.emptyState.style.display = 'none';
 
     // 更新顶部状态
-    DOM.topbarStatus.textContent = '已连接';
-    DOM.topbarStatus.className = 'topbar-status connected';
+    if (DOM.topbarStatus) { DOM.topbarStatus.textContent = '已连接'; DOM.topbarStatus.className = 'topbar-status connected'; }
 
     // 自动加载服务器列表
     loadServers();
@@ -97,17 +101,14 @@ function doLogout() {
     API.hosts = [];
     API.statusCache = {};
 
-    DOM.btnLogin.style.display = 'block';
-    DOM.btnLogout.style.display = 'none';
-    DOM.panelBatch.style.display = 'none';
-    DOM.btnRefresh.disabled = true;
-    DOM.tableWrapper.style.display = 'none';
-    DOM.emptyState.style.display = 'block';
-    DOM.emptyState.innerHTML = '<p>👆 请先在左侧配置 API 信息并登录</p>';
-    DOM.serverCount.textContent = '共 0 台';
-
-    DOM.topbarStatus.textContent = '未连接';
-    DOM.topbarStatus.className = 'topbar-status';
+    if (DOM.btnLogin) DOM.btnLogin.style.display = 'block';
+    if (DOM.btnLogout) DOM.btnLogout.style.display = 'none';
+    if (DOM.panelBatch) DOM.panelBatch.style.display = 'none';
+    if (DOM.btnRefresh) DOM.btnRefresh.disabled = true;
+    if (DOM.tableWrapper) DOM.tableWrapper.style.display = 'none';
+    if (DOM.emptyState) { DOM.emptyState.style.display = 'block'; DOM.emptyState.innerHTML = '<p>👆 请先在左侧配置 API 信息并登录</p>'; }
+    if (DOM.serverCount) DOM.serverCount.textContent = '共 0 台';
+    if (DOM.topbarStatus) { DOM.topbarStatus.textContent = '未连接'; DOM.topbarStatus.className = 'topbar-status'; }
 
     showLoginMsg('已登出', '');
     showToast('已安全登出', 'info');
@@ -117,8 +118,10 @@ function doLogout() {
 }
 
 function showLoginMsg(msg, type) {
-    DOM.loginMsg.textContent = msg;
-    DOM.loginMsg.className = 'login-msg ' + (type || '');
+    if (DOM.loginMsg) {
+        DOM.loginMsg.textContent = msg;
+        DOM.loginMsg.className = 'login-msg ' + (type || '');
+    }
 }
 
 // ==================== 服务器列表加载 ====================
@@ -130,23 +133,21 @@ async function loadServers() {
     }
 
     showLoading(true);
-    DOM.emptyState.style.display = 'none';
-    DOM.tableWrapper.style.display = 'none';
+    if (DOM.emptyState) DOM.emptyState.style.display = 'none';
+    if (DOM.tableWrapper) DOM.tableWrapper.style.display = 'none';
 
     try {
         const result = await fetchHosts(1, 200);
         if (result.success) {
             renderServerTable(result.hosts);
-            DOM.serverCount.textContent = '共 ' + result.total + ' 台';
+            if (DOM.serverCount) DOM.serverCount.textContent = '共 ' + result.total + ' 台';
             showToast('已加载 ' + result.total + ' 台服务器', 'success');
         } else {
-            DOM.emptyState.style.display = 'block';
-            DOM.emptyState.innerHTML = '<p>❌ ' + result.error + '</p>';
+            if (DOM.emptyState) { DOM.emptyState.style.display = 'block'; DOM.emptyState.innerHTML = '<p>❌ ' + result.error + '</p>'; }
             showToast(result.error, 'error');
         }
     } catch (e) {
-        DOM.emptyState.style.display = 'block';
-        DOM.emptyState.innerHTML = '<p>❌ ' + e.message + '</p>';
+        if (DOM.emptyState) { DOM.emptyState.style.display = 'block'; DOM.emptyState.innerHTML = '<p>❌ ' + e.message + '</p>'; }
         showToast(e.message, 'error');
     }
 
@@ -154,7 +155,7 @@ async function loadServers() {
 }
 
 function showLoading(show) {
-    DOM.loadingArea.style.display = show ? 'flex' : 'none';
+    if (DOM.loadingArea) DOM.loadingArea.style.display = show ? 'flex' : 'none';
 }
 
 // ==================== 表格渲染 ====================
@@ -541,9 +542,9 @@ if (DOM.adminPasswordInput) {
     try {
         const saved = await loadAuth();
         if (saved && saved.account && saved.apiKey) {
-            DOM.account.value = saved.account;
-            DOM.apiKey.value = saved.apiKey;
-            if (saved.baseUrl) {
+            if (DOM.account) DOM.account.value = saved.account;
+            if (DOM.apiKey) DOM.apiKey.value = saved.apiKey;
+            if (saved.baseUrl && DOM.apiBaseUrl) {
                 DOM.apiBaseUrl.value = saved.baseUrl;
             }
             showLoginMsg('📋 已加载上次保存的凭证 (' + saved.account + ')，可直接登录', 'success');
