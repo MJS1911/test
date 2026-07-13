@@ -1163,48 +1163,73 @@ function extractOpError(resp, fallback) {
 }
 
 /**
- * 恢复单机：优先 hard_reboot；失败/不支持/需二次验证 → reboot 兜底
+ * 恢复单机：hard_reboot → 失败再 reboot → 再失败则 on（开机）
+ * 部分关机机器不支持重启/硬重启，只能开机
  */
 async function serverRecoverHost(providerBase, jwt, hostId) {
-  const hardParams = new URLSearchParams();
-  hardParams.append('id', String(hostId));
-  hardParams.append('func', 'hard_reboot');
-  let hardErr = '';
+  const prevErrs = [];
+
+  // 1) 硬重启
   try {
+    const hardParams = new URLSearchParams();
+    hardParams.append('id', String(hostId));
+    hardParams.append('func', 'hard_reboot');
     const hard = await serverApiRequest(providerBase, jwt, 'provision/default', 'POST', hardParams.toString(), true);
     if (isProvisionOpSuccess(hard)) {
       return { success: true, action: 'hard_reboot', msg: hard.msg || '硬重启成功' };
     }
-    hardErr = extractOpError(hard, '硬重启失败');
-    if (hard && hard.data && hard.data._second_verify) {
-      hardErr = '硬重启需二次验证';
-    }
+    let hardErr = extractOpError(hard, '硬重启失败');
+    if (hard && hard.data && hard.data._second_verify) hardErr = '硬重启需二次验证';
+    prevErrs.push('硬重启: ' + hardErr);
   } catch (e) {
-    hardErr = e.message || '硬重启异常';
+    prevErrs.push('硬重启: ' + (e.message || '硬重启异常'));
   }
 
-  const softParams = new URLSearchParams();
-  softParams.append('id', String(hostId));
-  softParams.append('func', 'reboot');
+  // 2) 软重启
   try {
+    const softParams = new URLSearchParams();
+    softParams.append('id', String(hostId));
+    softParams.append('func', 'reboot');
     const soft = await serverApiRequest(providerBase, jwt, 'provision/default', 'POST', softParams.toString(), true);
     if (isProvisionOpSuccess(soft)) {
       return {
         success: true,
         action: 'reboot',
-        msg: (soft.msg || '重启成功') + (hardErr ? '（硬重启: ' + hardErr + '）' : '')
+        msg: (soft.msg || '重启成功') + (prevErrs.length ? '（' + prevErrs.join('；') + '）' : '')
       };
     }
+    let softErr = extractOpError(soft, '重启失败');
+    if (soft && soft.data && soft.data._second_verify) softErr = '重启需二次验证';
+    prevErrs.push('重启: ' + softErr);
+  } catch (e) {
+    prevErrs.push('重启: ' + (e.message || '重启异常'));
+  }
+
+  // 3) 开机（关机态部分机只能 on）
+  try {
+    const onParams = new URLSearchParams();
+    onParams.append('id', String(hostId));
+    onParams.append('func', 'on');
+    const onResp = await serverApiRequest(providerBase, jwt, 'provision/default', 'POST', onParams.toString(), true);
+    if (isProvisionOpSuccess(onResp)) {
+      return {
+        success: true,
+        action: 'on',
+        msg: (onResp.msg || '开机成功') + (prevErrs.length ? '（' + prevErrs.join('；') + '）' : '')
+      };
+    }
+    let onErr = extractOpError(onResp, '开机失败');
+    if (onResp && onResp.data && onResp.data._second_verify) onErr = '开机需二次验证';
     return {
       success: false,
-      action: 'reboot',
-      error: extractOpError(soft, '重启失败') + (hardErr ? '；硬重启: ' + hardErr : '')
+      action: 'on',
+      error: onErr + (prevErrs.length ? '；' + prevErrs.join('；') : '')
     };
   } catch (e) {
     return {
       success: false,
-      action: 'reboot',
-      error: (e.message || '重启异常') + (hardErr ? '；硬重启: ' + hardErr : '')
+      action: 'on',
+      error: (e.message || '开机异常') + (prevErrs.length ? '；' + prevErrs.join('；') : '')
     };
   }
 }
