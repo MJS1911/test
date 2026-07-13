@@ -916,20 +916,30 @@ async function handleProviderAutoLogin(context) {
 
 // ==================== 服务端定时巡检（KV 持久化，关网页不停） ====================
 // KV keys:
-//   schedule_config  - { enabled, intervalMin, lastRunAt, nextRunAt, running, lastSummary, updatedAt }
-//   schedule_logs    - [{ ts, level, msg, detail? }, ...] 最多 100 条
+//   schedule_config  - { enabled, intervalMin, lastRunAt, nextRunAt, running, lastSummary,
+//                        stats, cursor, progress, updatedAt }
+//   schedule_logs    - [{ ts, level, msg, detail? }, ...] 最多 150 条
 //
-// 触发方式（任选其一，推荐 1）：
-// 1. Cloudflare Cron Triggers 每分钟打 GET/POST /api/schedule/run（内部按 intervalMin 判断是否执行）
-// 2. 外部 cron（如 cron-job.org）每分钟请求 https://你的站点.pages.dev/api/schedule/run
-// 3. 前端打开时也会轮询 status；手动可 POST /api/schedule/run?force=1 立即跑一轮
+// 关页后必须有「触发器」周期性访问 /api/schedule/run（Pages 无常驻进程）：
+// 1. 外部 cron（cron-job.org / UptimeRobot）每 1 分钟 GET/POST 你的站点 /api/schedule/run
+// 2. 打开本页时前端每分钟也会辅助触发
+// 3. 手动「立即巡检」= force 全量跑完（分片续跑直到全部机器处理完）
+//
+// 分片续跑：单次 Function 有 CPU/时长上限，多机时按时间片处理，未完成则 waitUntil
+// 自调用 /api/schedule/run?continue=1 继续，保证每一台都会查状态并恢复。
 
 const SCHEDULE_CONFIG_KEY = 'schedule_config';
 const SCHEDULE_LOGS_KEY = 'schedule_logs';
-const SCHEDULE_MAX_LOGS = 100;
+const SCHEDULE_MAX_LOGS = 150;
 const SCHEDULE_DEFAULT_INTERVAL = 5;
 const SCHEDULE_MIN_INTERVAL = 1;
 const SCHEDULE_MAX_INTERVAL = 1440;
+/** 单次调用时间预算(ms)，留余量给收尾与自续跑，避免 CF 硬超时只处理 1 台 */
+const SCHEDULE_TIME_BUDGET_MS = 22000;
+/** 卡住 running 超过此时长则强制解锁续跑 */
+const SCHEDULE_STALE_MS = 90 * 1000;
+/** 主机间最小间隔，避免打爆目标站 */
+const SCHEDULE_HOST_GAP_MS = 80;
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -946,8 +956,15 @@ function defaultScheduleConfig() {
     nextRunAt: null,
     running: false,
     lastSummary: null,
+    stats: null,
+    cursor: null,
+    progress: null,
     updatedAt: null
   };
+}
+
+function defaultRoundStats() {
+  return { checked: 0, running: 0, recovered: 0, failed: 0 };
 }
 
 async function getScheduleConfig(env) {
@@ -980,21 +997,43 @@ async function getScheduleLogs(env) {
   }
 }
 
-async function appendScheduleLog(env, level, msg, detail) {
-  if (!env.AUTH_KV) return;
+/** 批量追加日志（减少 KV 读写，避免超时） */
+async function appendScheduleLogsBatch(env, entries) {
+  if (!env.AUTH_KV || !entries || !entries.length) return;
   try {
     const logs = await getScheduleLogs(env);
-    logs.unshift({
-      ts: new Date().toISOString(),
-      level: level || 'info',
-      msg: String(msg || ''),
-      detail: detail != null ? String(detail).substring(0, 500) : undefined
-    });
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i];
+      logs.unshift({
+        ts: e.ts || new Date().toISOString(),
+        level: e.level || 'info',
+        msg: String(e.msg || ''),
+        detail: e.detail != null ? String(e.detail).substring(0, 500) : undefined
+      });
+    }
     while (logs.length > SCHEDULE_MAX_LOGS) logs.pop();
     await env.AUTH_KV.put(SCHEDULE_LOGS_KEY, JSON.stringify(logs));
   } catch (e) {
-    console.warn('appendScheduleLog failed:', e);
+    console.warn('appendScheduleLogsBatch failed:', e);
   }
+}
+
+async function appendScheduleLog(env, level, msg, detail) {
+  await appendScheduleLogsBatch(env, [{ level, msg, detail }]);
+}
+
+function createLogBuffer() {
+  const buf = [];
+  return {
+    push(level, msg, detail) {
+      buf.push({ ts: new Date().toISOString(), level, msg, detail });
+    },
+    async flush(env) {
+      if (!buf.length) return;
+      const copy = buf.splice(0, buf.length);
+      await appendScheduleLogsBatch(env, copy);
+    }
+  };
 }
 
 /** 服务端登录服务商，返回 jwt 或 null */
@@ -1026,7 +1065,12 @@ async function serverLoginProvider(provider) {
     body: formBody.toString(),
     redirect: 'follow'
   });
-  const loginData = await loginResp.json();
+  let loginData;
+  try {
+    loginData = await loginResp.json();
+  } catch (e) {
+    return { ok: false, error: '登录响应非 JSON: HTTP ' + loginResp.status };
+  }
 
   let jwt = null;
   if (loginData.status === 200) {
@@ -1082,197 +1126,448 @@ async function serverApiRequest(providerBase, jwt, relativePath, method, bodyStr
 function isHostRunningStatus(data) {
   if (!data) return false;
   const s = String(data.status || '').toLowerCase();
-  return s === 'on' || s === 'running' || s === 'online';
+  // 开机 / 运行中 视为正常，不恢复
+  if (s === 'on' || s === 'running' || s === 'online' || s === 'active') return true;
+  const des = String(data.des || data.description || '').toLowerCase();
+  if (des.includes('运行') || des.includes('开机') || des === 'on') return true;
+  return false;
 }
 
+/** 判断 provision 操作是否真正成功（含「不支持硬重启」等文案） */
+function isProvisionOpSuccess(resp) {
+  if (!resp || resp.status !== 200) return false;
+  if (resp.data && resp.data._second_verify) return false;
+  const msg = String(resp.msg || resp.info || resp.message || '');
+  if (/不支持|失败|error|fail|未开通|无法|禁止|无效|错误/i.test(msg)) return false;
+  return true;
+}
+
+function extractOpError(resp, fallback) {
+  if (!resp) return fallback || '未知错误';
+  if (typeof resp.msg === 'string' && resp.msg) return resp.msg;
+  if (typeof resp.info === 'string' && resp.info) return resp.info;
+  if (typeof resp.message === 'string' && resp.message) return resp.message;
+  return fallback || '操作失败';
+}
+
+/**
+ * 恢复单机：优先 hard_reboot；失败/不支持/需二次验证 → reboot 兜底
+ */
 async function serverRecoverHost(providerBase, jwt, hostId) {
-  // 优先硬重启
   const hardParams = new URLSearchParams();
   hardParams.append('id', String(hostId));
   hardParams.append('func', 'hard_reboot');
+  let hardErr = '';
   try {
     const hard = await serverApiRequest(providerBase, jwt, 'provision/default', 'POST', hardParams.toString(), true);
-    if (hard && hard.status === 200 && !(hard.data && hard.data._second_verify)) {
+    if (isProvisionOpSuccess(hard)) {
       return { success: true, action: 'hard_reboot', msg: hard.msg || '硬重启成功' };
     }
+    hardErr = extractOpError(hard, '硬重启失败');
+    if (hard && hard.data && hard.data._second_verify) {
+      hardErr = '硬重启需二次验证';
+    }
   } catch (e) {
-    // fall through
+    hardErr = e.message || '硬重启异常';
   }
-  // 兜底普通重启
+
   const softParams = new URLSearchParams();
   softParams.append('id', String(hostId));
   softParams.append('func', 'reboot');
   try {
     const soft = await serverApiRequest(providerBase, jwt, 'provision/default', 'POST', softParams.toString(), true);
-    if (soft && soft.status === 200 && !(soft.data && soft.data._second_verify)) {
-      return { success: true, action: 'reboot', msg: soft.msg || '重启成功' };
+    if (isProvisionOpSuccess(soft)) {
+      return {
+        success: true,
+        action: 'reboot',
+        msg: (soft.msg || '重启成功') + (hardErr ? '（硬重启: ' + hardErr + '）' : '')
+      };
     }
     return {
       success: false,
       action: 'reboot',
-      error: (soft && (soft.msg || soft.info)) || '重启失败'
+      error: extractOpError(soft, '重启失败') + (hardErr ? '；硬重启: ' + hardErr : '')
     };
   } catch (e) {
-    return { success: false, action: 'reboot', error: e.message };
+    return {
+      success: false,
+      action: 'reboot',
+      error: (e.message || '重启异常') + (hardErr ? '；硬重启: ' + hardErr : '')
+    };
   }
 }
 
+/** 拉取某服务商全部主机（分页） */
+async function serverFetchAllHosts(providerBase, jwt) {
+  const all = [];
+  let page = 1;
+  const limit = 100;
+  for (; page <= 20; page++) {
+    const hostsResp = await serverApiRequest(
+      providerBase, jwt, 'hosts?page=' + page + '&limit=' + limit, 'GET', null, false
+    );
+    if (!hostsResp || hostsResp.status !== 200) {
+      if (page === 1) {
+        return {
+          ok: false,
+          error: (hostsResp && (hostsResp.msg || hostsResp.info)) || '获取服务器列表失败',
+          hosts: []
+        };
+      }
+      break;
+    }
+    const list = (hostsResp.data && hostsResp.data.host) || [];
+    if (!list.length) break;
+    for (const h of list) all.push(h);
+    const total = Number(hostsResp.data && hostsResp.data.total);
+    if (!isNaN(total) && all.length >= total) break;
+    if (list.length < limit) break;
+  }
+  return { ok: true, hosts: all };
+}
+
+function sleepMs(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+/** 写入 KV 的 cursor 去掉 jwt，续跑时重新登录 */
+function sanitizeCursorForKv(cursor) {
+  if (!cursor) return null;
+  return {
+    providerIdx: cursor.providerIdx || 0,
+    hostIdx: cursor.hostIdx || 0,
+    hostIds: cursor.hostIds || null,
+    providerId: cursor.providerId || null,
+    jwt: null,
+    baseUrl: null,
+    pname: cursor.pname || null
+  };
+}
+
 /**
- * 执行一轮：遍历所有服务商 → 登录 → 拉 hosts → 查 status → 非运行则 hard_reboot→reboot
+ * 执行/续跑一轮巡检。
+ * options: { force, isContinue }
+ * 返回 needContinue=true 时调用方应 waitUntil 自调用 continue
+ *
+ * 关键：外部 cron 只打 /api/schedule/run（无 continue=1）时，
+ * 若 KV 里仍有未完成 cursor，必须自动续跑，绝不能重置到第 0 台，
+ * 否则关页后每分钟只会重复处理前几台。
  */
 async function executeScheduleRound(env, options = {}) {
   const force = !!options.force;
+  const isContinue = !!options.isContinue;
   let cfg = await getScheduleConfig(env);
 
-  if (!cfg.enabled && !force) {
+  // 有未完成分片进度：非 force 一律续跑（cron 无 continue 参数也能接上）
+  const hasIncomplete = !!(cfg.cursor && (
+    cfg.running ||
+    (Array.isArray(cfg.cursor.hostIds) && cfg.cursor.hostIds.length > 0) ||
+    (cfg.cursor.providerIdx > 0) ||
+    (cfg.cursor.hostIdx > 0)
+  ));
+  const resume = !force && hasIncomplete;
+
+  if (!cfg.enabled && !force && !resume) {
     return { skipped: true, reason: 'disabled', config: cfg };
   }
 
-  // 未到下次执行时间则跳过（force 除外）
-  if (!force && cfg.nextRunAt) {
-    const next = new Date(cfg.nextRunAt).getTime();
-    if (!isNaN(next) && Date.now() < next - 2000) {
-      return { skipped: true, reason: 'not_due', config: cfg, nextRunAt: cfg.nextRunAt };
-    }
+  // 显式 continue 但无进度
+  if (isContinue && !hasIncomplete) {
+    return { skipped: true, reason: 'no_cursor', config: cfg };
   }
 
-  // 防并发：若标记 running 且 10 分钟内，跳过
-  if (cfg.running && cfg.updatedAt) {
-    const updated = new Date(cfg.updatedAt).getTime();
-    if (!isNaN(updated) && Date.now() - updated < 10 * 60 * 1000) {
-      return { skipped: true, reason: 'already_running', config: cfg };
+  if (resume) {
+    // 另一分片刚写入（15s 内）则避免双开；过期则接管续跑
+    if (cfg.running && cfg.updatedAt && !isContinue) {
+      const updated = new Date(cfg.updatedAt).getTime();
+      if (!isNaN(updated) && Date.now() - updated < 15000) {
+        return {
+          skipped: true,
+          reason: 'already_running',
+          needContinue: true,
+          config: cfg,
+          summary: formatScheduleSummary(cfg.stats) + (cfg.progress ? ' · ' + cfg.progress : '')
+        };
+      }
     }
+  } else {
+    // 新一轮：未到点则跳过（force 除外）
+    if (!force && cfg.nextRunAt) {
+      const next = new Date(cfg.nextRunAt).getTime();
+      if (!isNaN(next) && Date.now() < next - 2000) {
+        return { skipped: true, reason: 'not_due', config: cfg, nextRunAt: cfg.nextRunAt };
+      }
+    }
+    // 防并发：非 force 且 running 未过期 → 跳过；force 或过期则强制开新一轮
+    if (!force && cfg.running && cfg.updatedAt) {
+      const updated = new Date(cfg.updatedAt).getTime();
+      if (!isNaN(updated) && Date.now() - updated < SCHEDULE_STALE_MS) {
+        return { skipped: true, reason: 'already_running', config: cfg };
+      }
+    }
+    // 开新一轮前清掉旧进度
+    cfg.running = false;
+    cfg.cursor = null;
+    cfg.progress = null;
   }
 
-  cfg.running = true;
-  await saveScheduleConfig(env, cfg);
-  await appendScheduleLog(env, 'info', '开始巡检', 'interval=' + cfg.intervalMin + 'min');
-
+  const logBuf = createLogBuffer();
+  const startedAt = Date.now();
   const providers = await getProviders(env);
-  let totalChecked = 0, totalRunning = 0, totalRecovered = 0, totalFailed = 0;
-  const providerResults = [];
+
+  let stats;
+  let cursor;
+  if (resume) {
+    stats = Object.assign(defaultRoundStats(), cfg.stats || {});
+    cursor = Object.assign({
+      providerIdx: 0, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null, pname: null
+    }, cfg.cursor || {});
+    // 心跳：标记本分片已接管，供并发跳过
+    cfg.running = true;
+    cfg.stats = stats;
+    cfg.cursor = sanitizeCursorForKv(cursor);
+    await saveScheduleConfig(env, cfg);
+    logBuf.push('info', '续跑巡检', 'p=' + (cursor.providerIdx || 0) + ' h=' + (cursor.hostIdx || 0) +
+      (cursor.hostIds ? '/' + cursor.hostIds.length : '') + (isContinue ? ' (continue)' : ' (cron/auto)'));
+  } else {
+    stats = defaultRoundStats();
+    cursor = { providerIdx: 0, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null, pname: null };
+    cfg.running = true;
+    cfg.cursor = sanitizeCursorForKv(cursor);
+    cfg.stats = stats;
+    cfg.progress = '0%';
+    await saveScheduleConfig(env, cfg);
+    logBuf.push('info', '开始巡检', 'interval=' + (cfg.intervalMin || SCHEDULE_DEFAULT_INTERVAL) + 'min force=' + force);
+  }
+
+  if (!providers || providers.length === 0) {
+    logBuf.push('warning', '无服务商，跳过');
+    await logBuf.flush(env);
+    return await finishScheduleRound(env, cfg, stats, logBuf, true);
+  }
 
   try {
-    if (!providers || providers.length === 0) {
-      await appendScheduleLog(env, 'warning', '无服务商，跳过');
-    }
+    let pIdx = cursor.providerIdx || 0;
 
-    for (const provider of providers || []) {
+    while (pIdx < providers.length) {
+      if (Date.now() - startedAt > SCHEDULE_TIME_BUDGET_MS) {
+        cursor.providerIdx = pIdx;
+        // 不把 jwt 写入 KV（安全 + 体积）；续跑时重新登录
+        cfg.cursor = sanitizeCursorForKv(cursor);
+        cfg.stats = stats;
+        cfg.running = true;
+        cfg.progress = '服务商 ' + (pIdx + 1) + '/' + providers.length;
+        await saveScheduleConfig(env, cfg);
+        await logBuf.flush(env);
+        return {
+          skipped: false,
+          success: true,
+          partial: true,
+          needContinue: true,
+          summary: formatScheduleSummary(stats) + '（分片续跑中…）',
+          stats,
+          config: cfg
+        };
+      }
+
+      const provider = providers[pIdx];
       const pname = provider.name || provider.id || 'unknown';
-      const pResult = { id: provider.id, name: pname, checked: 0, running: 0, recovered: 0, failed: 0, error: null };
 
-      try {
+      // 需要登录 + 拉列表（新服务商或 hostIds 未缓存）；续跑时重新登录拿新 JWT
+      if (!cursor.hostIds || cursor.providerId !== provider.id || !cursor.jwt || !cursor.baseUrl) {
         if (!provider.account || !provider.apiKey) {
-          pResult.error = '缺少登录凭证';
-          await appendScheduleLog(env, 'warning', '[' + pname + '] 缺少凭证，跳过');
-          providerResults.push(pResult);
+          logBuf.push('warning', '[' + pname + '] 缺少凭证，跳过');
+          stats.failed++;
+          pIdx++;
+          cursor = { providerIdx: pIdx, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null };
           continue;
         }
 
         const login = await serverLoginProvider(provider);
         if (!login.ok) {
-          pResult.error = login.error;
-          totalFailed++;
-          await appendScheduleLog(env, 'error', '[' + pname + '] 登录失败', login.error);
-          providerResults.push(pResult);
+          logBuf.push('error', '[' + pname + '] 登录失败', login.error);
+          stats.failed++;
+          pIdx++;
+          cursor = { providerIdx: pIdx, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null };
           continue;
         }
 
-        // 拉服务器列表
-        const hostsResp = await serverApiRequest(login.baseUrl, login.jwt, 'hosts?page=1&limit=200', 'GET', null, false);
-        if (!hostsResp || hostsResp.status !== 200) {
-          pResult.error = (hostsResp && (hostsResp.msg || hostsResp.info)) || '获取服务器列表失败';
-          totalFailed++;
-          await appendScheduleLog(env, 'error', '[' + pname + '] 获取列表失败', pResult.error);
-          providerResults.push(pResult);
-          continue;
-        }
-
-        const hosts = (hostsResp.data && hostsResp.data.host) || [];
-        await appendScheduleLog(env, 'info', '[' + pname + '] 开始检查', '共 ' + hosts.length + ' 台');
-
-        for (const host of hosts) {
-          const hostId = host.id;
-          if (!hostId) continue;
-          try {
-            const stParams = new URLSearchParams();
-            stParams.append('id', String(hostId));
-            stParams.append('func', 'status');
-            const st = await serverApiRequest(login.baseUrl, login.jwt, 'provision/default', 'POST', stParams.toString(), true);
-
-            if (st && st.status === 200) {
-              pResult.checked++;
-              totalChecked++;
-              const data = st.data || {};
-              if (isHostRunningStatus(data)) {
-                pResult.running++;
-                totalRunning++;
-              } else {
-                const des = data.des || data.status || '非运行中';
-                await appendScheduleLog(env, 'warning', '[' + pname + '] #' + hostId + ' 非运行中 (' + des + ')，尝试恢复');
-                const rec = await serverRecoverHost(login.baseUrl, login.jwt, hostId);
-                if (rec.success) {
-                  pResult.recovered++;
-                  totalRecovered++;
-                  await appendScheduleLog(env, 'success', '[' + pname + '] #' + hostId + ' ' + rec.action + ' 成功', rec.msg);
-                } else {
-                  pResult.failed++;
-                  totalFailed++;
-                  await appendScheduleLog(env, 'error', '[' + pname + '] #' + hostId + ' 恢复失败', rec.error);
-                }
-              }
-            } else {
-              pResult.failed++;
-              totalFailed++;
-              const err = (st && (st.msg || st.info)) || '查状态失败';
-              await appendScheduleLog(env, 'error', '[' + pname + '] #' + hostId + ' 查状态失败', err);
-            }
-          } catch (hostErr) {
-            pResult.failed++;
-            totalFailed++;
-            await appendScheduleLog(env, 'error', '[' + pname + '] #' + hostId + ' 异常', hostErr.message);
+        let hostIds = cursor.hostIds;
+        let hostIdx = cursor.hostIdx || 0;
+        // 同一服务商续跑：保留 hostIds/hostIdx，只刷新 jwt
+        if (!hostIds || cursor.providerId !== provider.id) {
+          const hostsRes = await serverFetchAllHosts(login.baseUrl, login.jwt);
+          if (!hostsRes.ok) {
+            logBuf.push('error', '[' + pname + '] 获取列表失败', hostsRes.error);
+            stats.failed++;
+            pIdx++;
+            cursor = { providerIdx: pIdx, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null };
+            continue;
           }
-          // 轻微间隔，避免打爆目标站
-          await new Promise(r => setTimeout(r, 200));
+          hostIds = hostsRes.hosts.map(h => h.id).filter(Boolean);
+          hostIdx = 0;
+          logBuf.push('info', '[' + pname + '] 开始检查', '共 ' + hostIds.length + ' 台');
+        } else {
+          logBuf.push('info', '[' + pname + '] 续跑', '从第 ' + (hostIdx + 1) + '/' + hostIds.length + ' 台');
         }
-      } catch (pErr) {
-        pResult.error = pErr.message;
-        totalFailed++;
-        await appendScheduleLog(env, 'error', '[' + pname + '] 异常', pErr.message);
+
+        cursor = {
+          providerIdx: pIdx,
+          hostIdx,
+          hostIds,
+          providerId: provider.id,
+          jwt: login.jwt,
+          baseUrl: login.baseUrl,
+          pname
+        };
       }
-      providerResults.push(pResult);
+
+      const hostIds = cursor.hostIds || [];
+      let hIdx = cursor.hostIdx || 0;
+
+      while (hIdx < hostIds.length) {
+        if (Date.now() - startedAt > SCHEDULE_TIME_BUDGET_MS) {
+          cursor.hostIdx = hIdx;
+          cursor.providerIdx = pIdx;
+          cfg.cursor = sanitizeCursorForKv(cursor);
+          cfg.stats = stats;
+          cfg.running = true;
+          cfg.progress = '[' + (cursor.pname || pname) + '] ' + hIdx + '/' + hostIds.length;
+          await saveScheduleConfig(env, cfg);
+          await logBuf.flush(env);
+          return {
+            skipped: false,
+            success: true,
+            partial: true,
+            needContinue: true,
+            summary: formatScheduleSummary(stats) + ' · 续跑 ' + cfg.progress,
+            stats,
+            config: cfg
+          };
+        }
+
+        const hostId = hostIds[hIdx];
+        hIdx++;
+        try {
+          const stParams = new URLSearchParams();
+          stParams.append('id', String(hostId));
+          stParams.append('func', 'status');
+          const st = await serverApiRequest(cursor.baseUrl, cursor.jwt, 'provision/default', 'POST', stParams.toString(), true);
+
+          if (st && st.status === 200) {
+            stats.checked++;
+            const data = st.data || {};
+            if (isHostRunningStatus(data)) {
+              stats.running++;
+            } else {
+              const des = data.des || data.status || '非运行中';
+              logBuf.push('warning', '[' + pname + '] #' + hostId + ' 非运行中 (' + des + ')，尝试恢复');
+              const rec = await serverRecoverHost(cursor.baseUrl, cursor.jwt, hostId);
+              if (rec.success) {
+                stats.recovered++;
+                logBuf.push('success', '[' + pname + '] #' + hostId + ' ' + rec.action + ' 成功', rec.msg);
+              } else {
+                stats.failed++;
+                logBuf.push('error', '[' + pname + '] #' + hostId + ' 恢复失败', rec.error);
+              }
+            }
+          } else {
+            stats.failed++;
+            logBuf.push('error', '[' + pname + '] #' + hostId + ' 查状态失败', extractOpError(st, '查状态失败'));
+          }
+        } catch (hostErr) {
+          stats.failed++;
+          logBuf.push('error', '[' + pname + '] #' + hostId + ' 异常', hostErr.message);
+        }
+
+        await sleepMs(SCHEDULE_HOST_GAP_MS);
+      }
+
+      // 当前服务商完成
+      pIdx++;
+      cursor = { providerIdx: pIdx, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null };
     }
 
-    const summary = '检查 ' + totalChecked + ' · 运行中 ' + totalRunning + ' · 已恢复 ' + totalRecovered + ' · 失败 ' + totalFailed;
-    const now = new Date();
-    const intervalMin = Math.max(SCHEDULE_MIN_INTERVAL, Math.min(SCHEDULE_MAX_INTERVAL, cfg.intervalMin || SCHEDULE_DEFAULT_INTERVAL));
-    cfg = await getScheduleConfig(env); // 重新读，避免覆盖用户中途 stop
-    cfg.running = false;
-    cfg.lastRunAt = now.toISOString();
-    cfg.lastSummary = summary;
-    if (cfg.enabled) {
-      cfg.nextRunAt = new Date(now.getTime() + intervalMin * 60 * 1000).toISOString();
-    } else {
-      cfg.nextRunAt = null;
-    }
-    await saveScheduleConfig(env, cfg);
-    await appendScheduleLog(env, 'info', '本轮完成', summary);
-
-    return {
-      skipped: false,
-      success: true,
-      summary,
-      stats: { checked: totalChecked, running: totalRunning, recovered: totalRecovered, failed: totalFailed },
-      providers: providerResults,
-      config: cfg
-    };
+    await logBuf.flush(env);
+    return await finishScheduleRound(env, cfg, stats, logBuf, false);
   } catch (e) {
+    logBuf.push('error', '巡检异常', e.message);
+    await logBuf.flush(env);
     cfg = await getScheduleConfig(env);
-    cfg.running = false;
+    // 保留 cursor 以便下次续跑，但若无 cursor 则清 running
+    if (!cfg.cursor) {
+      cfg.running = false;
+    }
     cfg.lastSummary = '执行异常: ' + e.message;
     await saveScheduleConfig(env, cfg);
-    await appendScheduleLog(env, 'error', '巡检异常', e.message);
-    return { skipped: false, success: false, error: e.message, config: cfg };
+    return {
+      skipped: false,
+      success: false,
+      error: e.message,
+      needContinue: !!cfg.cursor,
+      config: cfg
+    };
+  }
+}
+
+function formatScheduleSummary(stats) {
+  const s = stats || defaultRoundStats();
+  return '检查 ' + s.checked + ' · 运行中 ' + s.running + ' · 已恢复 ' + s.recovered + ' · 失败 ' + s.failed;
+}
+
+async function finishScheduleRound(env, cfgIn, stats, logBuf, emptyProviders) {
+  const summary = formatScheduleSummary(stats);
+  const now = new Date();
+  let cfg = await getScheduleConfig(env);
+  const intervalMin = Math.max(
+    SCHEDULE_MIN_INTERVAL,
+    Math.min(SCHEDULE_MAX_INTERVAL, cfg.intervalMin || SCHEDULE_DEFAULT_INTERVAL)
+  );
+  cfg.running = false;
+  cfg.cursor = null;
+  cfg.progress = null;
+  cfg.stats = stats;
+  cfg.lastRunAt = now.toISOString();
+  cfg.lastSummary = summary;
+  if (cfg.enabled) {
+    cfg.nextRunAt = new Date(now.getTime() + intervalMin * 60 * 1000).toISOString();
+  } else {
+    cfg.nextRunAt = null;
+  }
+  await saveScheduleConfig(env, cfg);
+  if (logBuf) {
+    logBuf.push('info', emptyProviders ? '本轮结束（无服务商）' : '本轮完成', summary);
+    await logBuf.flush(env);
+  } else {
+    await appendScheduleLog(env, 'info', emptyProviders ? '本轮结束（无服务商）' : '本轮完成', summary);
+  }
+  return {
+    skipped: false,
+    success: true,
+    partial: false,
+    needContinue: false,
+    summary,
+    stats,
+    config: cfg
+  };
+}
+
+/** 后台自续跑：waitUntil 再请求自己，把剩余机器跑完 */
+function scheduleContinueIfNeeded(context, request, result) {
+  if (!result || !result.needContinue || !context.waitUntil) return;
+  try {
+    const base = new URL(request.url);
+    const contUrl = new URL(base.pathname, base.origin);
+    contUrl.searchParams.set('continue', '1');
+    context.waitUntil(
+      fetch(contUrl.toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Schedule-Continue': '1' },
+        body: '{}'
+      }).catch(err => console.warn('schedule continue fetch failed:', err))
+    );
+  } catch (e) {
+    console.warn('scheduleContinueIfNeeded error:', e);
   }
 }
 
@@ -1285,7 +1580,7 @@ async function handleScheduleStatus(context) {
   try {
     const config = await getScheduleConfig(env);
     const logs = await getScheduleLogs(env);
-    return jsonResponse({ success: true, config, logs: logs.slice(0, 20) });
+    return jsonResponse({ success: true, config, logs: logs.slice(0, 30) });
   } catch (error) {
     return jsonResponse({ success: false, error: error.message }, 500);
   }
@@ -1317,20 +1612,18 @@ async function handleScheduleStart(context) {
     let cfg = await getScheduleConfig(env);
     cfg.enabled = true;
     cfg.intervalMin = intervalMin;
-    cfg.nextRunAt = new Date().toISOString(); // 立即到期，下次 run 会执行
+    cfg.nextRunAt = new Date().toISOString();
     cfg.running = false;
+    cfg.cursor = null;
+    cfg.progress = null;
     await saveScheduleConfig(env, cfg);
-    await appendScheduleLog(env, 'info', '定时已启动', '间隔 ' + intervalMin + ' 分钟，覆盖全部服务商');
+    await appendScheduleLog(env, 'info', '定时已启动', '间隔 ' + intervalMin + ' 分钟，覆盖全部服务商全部机器');
 
-    // 启动时立即跑一轮（waitUntil 若可用则后台，否则同步）
+    // 启动后立即跑一轮（同步跑完分片，waitUntil 续跑剩余）
     let runResult = null;
     try {
-      if (context.waitUntil) {
-        context.waitUntil(executeScheduleRound(env, { force: true }));
-        runResult = { deferred: true };
-      } else {
-        runResult = await executeScheduleRound(env, { force: true });
-      }
+      runResult = await executeScheduleRound(env, { force: true });
+      scheduleContinueIfNeeded(context, request, runResult);
     } catch (runErr) {
       console.warn('schedule start immediate run error:', runErr);
     }
@@ -1338,7 +1631,7 @@ async function handleScheduleStart(context) {
     cfg = await getScheduleConfig(env);
     return jsonResponse({
       success: true,
-      msg: '服务端定时已启动，关闭网页后仍会按间隔巡检全部服务商',
+      msg: '服务端定时已启动。关页后请用外部 cron 每分钟访问 /api/schedule/run，否则无法到点执行。',
       config: cfg,
       run: runResult
     });
@@ -1358,6 +1651,8 @@ async function handleScheduleStop(context) {
     cfg.enabled = false;
     cfg.nextRunAt = null;
     cfg.running = false;
+    cfg.cursor = null;
+    cfg.progress = null;
     await saveScheduleConfig(env, cfg);
     await appendScheduleLog(env, 'info', '定时已停止');
     return jsonResponse({ success: true, msg: '服务端定时已停止', config: cfg });
@@ -1366,7 +1661,7 @@ async function handleScheduleStop(context) {
   }
 }
 
-/** GET|POST /api/schedule/run  ?force=1 立即执行 */
+/** GET|POST /api/schedule/run  ?force=1 立即执行  ?continue=1 分片续跑 */
 async function handleScheduleRun(context) {
   const { request, env } = context;
   if (!env.AUTH_KV) {
@@ -1375,7 +1670,9 @@ async function handleScheduleRun(context) {
   try {
     const url = new URL(request.url);
     const force = url.searchParams.get('force') === '1' || url.searchParams.get('force') === 'true';
-    const result = await executeScheduleRound(env, { force });
+    const isContinue = url.searchParams.get('continue') === '1' || url.searchParams.get('continue') === 'true';
+    const result = await executeScheduleRound(env, { force, isContinue });
+    scheduleContinueIfNeeded(context, request, result);
     return jsonResponse({ success: true, ...result });
   } catch (error) {
     return jsonResponse({ success: false, error: error.message }, 500);

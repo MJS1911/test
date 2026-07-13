@@ -267,7 +267,8 @@ async function pollStatusAfterOperation(hostId, maxAttempts = 15, interval = 300
 
 // ==================== 服务端长效定时（CF Pages KV，关网页不停） ====================
 // 配置与执行均在服务端 /api/schedule/*；前端只负责启停与展示状态。
-// 巡检覆盖全部服务商，切换标签/关闭网页不会停止。
+// 巡检覆盖全部服务商全部机器；非运行中 hard_reboot → 失败则 reboot。
+// 关页后必须有外部 cron 每分钟访问 /api/schedule/run，否则到点不会执行。
 
 let scheduleConfig = {
     enabled: false,
@@ -275,10 +276,12 @@ let scheduleConfig = {
     lastRunAt: null,
     nextRunAt: null,
     running: false,
-    lastSummary: null
+    lastSummary: null,
+    progress: null
 };
 let scheduleStatusPollTimer = null;
 let scheduleUiBusy = false;
+let scheduleForceWatchTimer = null;
 
 function formatScheduleTime(ts) {
     if (!ts) return '-';
@@ -295,12 +298,14 @@ function updateScheduleUI() {
     const statusEl = document.getElementById('scheduleStatus');
     const btnStart = document.getElementById('btnScheduleStart');
     const btnStop = document.getElementById('btnScheduleStop');
+    const btnRun = document.getElementById('btnScheduleRunNow');
     const input = document.getElementById('scheduleInterval');
     const cfg = scheduleConfig || {};
     const enabled = !!cfg.enabled;
 
     if (btnStart) btnStart.disabled = enabled || scheduleUiBusy;
     if (btnStop) btnStop.disabled = !enabled || scheduleUiBusy;
+    if (btnRun) btnRun.disabled = scheduleUiBusy || !!cfg.running;
     if (input) {
         input.disabled = enabled || scheduleUiBusy;
         if (cfg.intervalMin && document.activeElement !== input) {
@@ -311,16 +316,21 @@ function updateScheduleUI() {
     if (!statusEl) return;
     if (!enabled) {
         let t = '未启动（服务端）';
+        if (cfg.running) t += ' · 巡检中…';
+        if (cfg.progress) t += ' · ' + cfg.progress;
         if (cfg.lastRunAt) t += ' · 上次 ' + formatScheduleTime(cfg.lastRunAt);
         if (cfg.lastSummary) t += ' · ' + cfg.lastSummary;
         statusEl.textContent = t;
         statusEl.className = 'schedule-status';
         return;
     }
-    let text = '服务端运行中 · 间隔 ' + (cfg.intervalMin || 5) + ' 分钟 · 全部服务商';
-    if (cfg.running) text += ' · 巡检中…';
+    let text = '服务端运行中 · 间隔 ' + (cfg.intervalMin || 5) + ' 分钟 · 全部服务商全部机器';
+    if (cfg.running) {
+        text += ' · 巡检中…';
+        if (cfg.progress) text += ' ' + cfg.progress;
+    }
     if (cfg.lastRunAt) text += ' · 上次 ' + formatScheduleTime(cfg.lastRunAt);
-    if (cfg.nextRunAt) text += ' · 下次 ' + formatScheduleTime(cfg.nextRunAt);
+    if (cfg.nextRunAt && !cfg.running) text += ' · 下次 ' + formatScheduleTime(cfg.nextRunAt);
     if (cfg.lastSummary) text += ' · ' + cfg.lastSummary;
     statusEl.textContent = text;
     statusEl.className = 'schedule-status running';
@@ -333,10 +343,6 @@ async function fetchScheduleStatus() {
         if (result && result.success && result.config) {
             scheduleConfig = result.config;
             updateScheduleUI();
-            // 将服务端最近日志同步到前端日志面板（仅 info/warning/error/success）
-            if (Array.isArray(result.logs) && result.logs.length && typeof log === 'function') {
-                // 不刷屏：只在用户打开时由 refresh 展示，这里不逐条 log
-            }
             return result;
         }
     } catch (e) {
@@ -345,10 +351,47 @@ async function fetchScheduleStatus() {
     return null;
 }
 
+/** 分片巡检进行中时，前端辅助触发 continue + 刷新状态 */
+function startForceWatchPolling() {
+    if (scheduleForceWatchTimer) return;
+    let ticks = 0;
+    scheduleForceWatchTimer = setInterval(function () {
+        ticks++;
+        fetch('/api/schedule/run?continue=1', { method: 'POST' })
+            .then(function (r) { return r.json(); })
+            .then(function (result) {
+                if (result && result.config) {
+                    scheduleConfig = result.config;
+                    updateScheduleUI();
+                }
+                if (!result || result.needContinue || (result.config && result.config.running)) {
+                    // 仍在跑
+                } else {
+                    stopForceWatchPolling();
+                    if (result && result.summary) {
+                        showToast(result.summary, 'success');
+                        log('info', '服务端巡检完成', result.summary);
+                    }
+                    fetchScheduleStatus();
+                }
+            })
+            .catch(function () { fetchScheduleStatus(); });
+        // 最长盯 8 分钟
+        if (ticks >= 96) stopForceWatchPolling();
+    }, 5000);
+}
+
+function stopForceWatchPolling() {
+    if (scheduleForceWatchTimer) {
+        clearInterval(scheduleForceWatchTimer);
+        scheduleForceWatchTimer = null;
+    }
+}
+
 function startScheduleStatusPolling() {
     if (scheduleStatusPollTimer) return;
-    // 每 60 秒：刷新状态 + 尝试触发 run（未到间隔会服务端跳过）
-    // 打开本页时可作为「免费 cron」；关页后需外部 cron 或 CF 定时打 /api/schedule/run
+    // 每 45 秒：刷新状态 + 触发 run（未到间隔跳过；有 cursor 则续跑）
+    // 打开本页时可作为辅助 cron；关页后必须配置外部 cron
     scheduleStatusPollTimer = setInterval(function () {
         fetch('/api/schedule/run', { method: 'POST' })
             .then(function (r) { return r.json(); })
@@ -356,12 +399,15 @@ function startScheduleStatusPolling() {
                 if (result && result.config) {
                     scheduleConfig = result.config;
                     updateScheduleUI();
+                    if (result.needContinue || (result.config && result.config.running && result.config.cursor)) {
+                        startForceWatchPolling();
+                    }
                 } else {
                     fetchScheduleStatus();
                 }
             })
             .catch(function () { fetchScheduleStatus(); });
-    }, 60000);
+    }, 45000);
 }
 
 function stopScheduleStatusPolling() {
@@ -372,8 +418,8 @@ function stopScheduleStatusPolling() {
 }
 
 /**
- * 启动服务端定时：配置写入 KV，由 /api/schedule/run（Cron/外部定时）按间隔执行
- * 关闭网页、切换服务商均不影响
+ * 启动服务端定时：配置写入 KV，由 /api/schedule/run 按间隔执行
+ * 关闭网页、切换服务商均不影响（但关页后需外部 cron 触发 run）
  */
 async function startScheduledOps() {
     if (scheduleUiBusy) return;
@@ -403,11 +449,15 @@ async function startScheduledOps() {
             scheduleConfig = result.config || scheduleConfig;
             updateScheduleUI();
             startScheduleStatusPolling();
-            showToast(result.msg || ('服务端定时已启动，间隔 ' + mins + ' 分钟'), 'success');
-            log('success', '服务端定时已启动', '间隔 ' + mins + ' 分钟，覆盖全部服务商；关闭网页后仍继续');
-            // 稍后刷新状态（启动时可能后台在跑第一轮）
-            setTimeout(fetchScheduleStatus, 3000);
-            setTimeout(fetchScheduleStatus, 15000);
+            if (result.run && (result.run.needContinue || (result.config && result.config.running))) {
+                startForceWatchPolling();
+            }
+            showToast('服务端定时已启动，间隔 ' + mins + ' 分钟', 'success');
+            log('success', '服务端定时已启动',
+                '间隔 ' + mins + ' 分钟；关页后请用 cron-job.org 每分钟访问 /api/schedule/run');
+            setTimeout(fetchScheduleStatus, 2000);
+            setTimeout(fetchScheduleStatus, 10000);
+            setTimeout(fetchScheduleStatus, 30000);
         } else {
             showToast((result && result.error) || '启动失败', 'error');
             log('error', '服务端定时启动失败', result && result.error);
@@ -433,7 +483,10 @@ async function stopScheduledOps(silent) {
         });
         const result = await resp.json();
         if (result && result.success) {
-            scheduleConfig = result.config || Object.assign({}, scheduleConfig, { enabled: false, nextRunAt: null, running: false });
+            scheduleConfig = result.config || Object.assign({}, scheduleConfig, {
+                enabled: false, nextRunAt: null, running: false, cursor: null, progress: null
+            });
+            stopForceWatchPolling();
             updateScheduleUI();
             if (!silent) {
                 showToast(result.msg || '服务端定时已停止', 'info');
@@ -450,9 +503,12 @@ async function stopScheduledOps(silent) {
     }
 }
 
-/** 手动触发一轮服务端巡检（force） */
+/** 手动触发一轮服务端巡检（force）；多机时分片续跑直到全部完成 */
 async function runScheduledCheck() {
-    showToast('正在触发服务端巡检…', 'info');
+    if (scheduleUiBusy) return;
+    scheduleUiBusy = true;
+    updateScheduleUI();
+    showToast('正在触发服务端巡检（全部机器）…', 'info');
     try {
         const resp = await fetch('/api/schedule/run?force=1', { method: 'POST' });
         const result = await resp.json();
@@ -460,6 +516,10 @@ async function runScheduledCheck() {
         updateScheduleUI();
         if (result && result.skipped) {
             showToast('已跳过: ' + (result.reason || ''), 'info');
+        } else if (result && result.needContinue) {
+            showToast((result.summary || '巡检进行中') + '，后台继续处理剩余机器…', 'info');
+            log('info', '服务端巡检分片进行中', result.summary);
+            startForceWatchPolling();
         } else if (result && result.success !== false) {
             showToast(result.summary || '巡检完成', 'success');
             log('info', '服务端巡检完成', result.summary);
@@ -467,8 +527,12 @@ async function runScheduledCheck() {
             showToast((result && result.error) || '巡检失败', 'error');
         }
         await fetchScheduleStatus();
+        if (scheduleConfig && scheduleConfig.running) startForceWatchPolling();
     } catch (e) {
         showToast('触发失败: ' + e.message, 'error');
+    } finally {
+        scheduleUiBusy = false;
+        updateScheduleUI();
     }
 }
 
@@ -489,10 +553,16 @@ if (typeof document !== 'undefined') {
             } else {
                 updateScheduleUI();
             }
+            if (r && r.config && r.config.running) {
+                startForceWatchPolling();
+            }
         });
-        // 页面可见时刷新一次状态
         document.addEventListener('visibilitychange', function () {
-            if (document.visibilityState === 'visible') fetchScheduleStatus();
+            if (document.visibilityState === 'visible') {
+                fetchScheduleStatus().then(function (r) {
+                    if (r && r.config && r.config.running) startForceWatchPolling();
+                });
+            }
         });
     });
 }
