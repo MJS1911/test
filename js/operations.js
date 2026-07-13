@@ -268,7 +268,7 @@ async function pollStatusAfterOperation(hostId, maxAttempts = 15, interval = 300
 // ==================== 服务端长效定时（CF Pages KV，关网页不停） ====================
 // 配置与执行均在服务端 /api/schedule/*；前端只负责启停与展示状态。
 // 巡检覆盖全部服务商全部机器；关机优先 on，其它 hard_reboot→reboot→on。
-// 关页后服务端 waitUntil 会连续分片续跑；仍须外部 cron 每分钟访问 /api/schedule/run 作兜底。
+// 关页后服务端 waitUntil 会连续分片续跑；到点触发靠 cron-worker（CF Cron）或 GitHub Actions。
 
 let scheduleConfig = {
     enabled: false,
@@ -408,7 +408,7 @@ function stopForceWatchPolling() {
 function startScheduleStatusPolling() {
     if (scheduleStatusPollTimer) return;
     // 每 30 秒：刷新状态 + 触发 run（未到间隔跳过；有 cursor 则续跑）
-    // 打开本页时可作为辅助 cron；关页后必须配置外部 cron
+    // 打开本页时可作为辅助触发；关页后由 cron-worker / GitHub Actions 触发
     scheduleStatusPollTimer = setInterval(function () {
         fetch('/api/schedule/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
             .then(function (r) { return r.json(); })
@@ -436,7 +436,7 @@ function stopScheduleStatusPolling() {
 
 /**
  * 启动服务端定时：配置写入 KV，由 /api/schedule/run 按间隔执行
- * 关闭网页、切换服务商均不影响（但关页后需外部 cron 触发 run）
+ * 关闭网页、切换服务商均不影响（关页后由 cron-worker 触发 run）
  */
 async function startScheduledOps() {
     if (scheduleUiBusy) return;
@@ -471,7 +471,7 @@ async function startScheduledOps() {
             }
             showToast('服务端定时已启动，间隔 ' + mins + ' 分钟', 'success');
             log('success', '服务端定时已启动',
-                '间隔 ' + mins + ' 分钟；关页后请用 cron-job.org 每分钟访问 /api/schedule/run');
+                '间隔 ' + mins + ' 分钟；关页后由 cron-worker（CF Cron）每分钟触发 /api/schedule/run');
             setTimeout(fetchScheduleStatus, 2000);
             setTimeout(fetchScheduleStatus, 10000);
             setTimeout(fetchScheduleStatus, 30000);

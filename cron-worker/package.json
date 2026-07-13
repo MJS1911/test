@@ -1,0 +1,14 @@
+{
+  "name": "mf-schedule-cron",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker Cron：每分钟触发 Pages /api/schedule/run，关浏览器仍巡检",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "secret:url": "wrangler secret put TARGET_URL"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

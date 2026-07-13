@@ -1,0 +1,19 @@
+# 关页定时触发器（Cloudflare Worker Cron Trigger）
+# 与参考项目 heyun-zjmf-worker-monitor 相同机制：平台每分钟唤醒 Worker，
+# 由 Worker 请求本站 Pages 的 /api/schedule/run，无需打开浏览器、无需 cron-job.org。
+#
+# 部署（在 html2/cron-worker 目录）：
+#   npx wrangler login
+#   npx wrangler secret put TARGET_URL
+#     # 填你的 Pages 地址，例如 https://xxx.pages.dev（不要末尾斜杠）
+#   npx wrangler deploy
+#
+# 可选：npx wrangler secret put CRON_SECRET  （若 Pages 配置了同名环境变量则校验）
+
+name = "mf-schedule-cron"
+main = "src/index.js"
+compatibility_date = "2026-05-10"
+
+# 每 1 分钟触发一次（免费套餐可用）
+[triggers]
+crons = ["* * * * *"]

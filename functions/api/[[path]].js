@@ -920,13 +920,13 @@ async function handleProviderAutoLogin(context) {
 //                        stats, cursor, progress, updatedAt }
 //   schedule_logs    - [{ ts, level, msg, detail? }, ...] 最多 150 条
 //
-// 关页后必须有「触发器」周期性访问 /api/schedule/run（Pages 无常驻进程）：
-// 1. 外部 cron（cron-job.org / UptimeRobot）每 1 分钟 GET/POST 你的站点 /api/schedule/run
-// 2. 打开本页时前端每分钟也会辅助触发
-// 3. 手动「立即巡检」= force 全量跑完（分片续跑直到全部机器处理完）
+// 关页后必须有「触发器」周期性访问 /api/schedule/run（Pages 无常驻进程）。
+// 与参考项目 heyun-zjmf-worker-monitor 相同思路：用 Cloudflare Worker Cron Trigger
+// （见仓库 cron-worker/）每分钟唤醒并 POST 本接口；也可配 GitHub Actions schedule。
+// 打开本页时前端会辅助触发；「立即巡检」= force 全量分片跑完。
 //
-// 分片续跑：单次 Function 有 CPU/时长上限，多机时按时间片处理，未完成则 waitUntil
-// 自调用 /api/schedule/run?continue=1 继续，保证每一台都会查状态并恢复。
+// 分片续跑：单次 Function 有时长上限，多机按时间片处理；未完成则 waitUntil 内
+// 直接循环 executeScheduleRound，保证每一台都会查状态并恢复。
 
 const SCHEDULE_CONFIG_KEY = 'schedule_config';
 const SCHEDULE_LOGS_KEY = 'schedule_logs';
@@ -1774,7 +1774,7 @@ async function finishScheduleRound(env, cfgIn, stats, logBuf, emptyProviders) {
  * 1) 优先在 waitUntil 内直接循环 executeScheduleRound（不依赖 HTTP 自调用，更可靠）
  * 2) 每跳仍带 bodyCursor 快照；hop 用尽后归零继续，直到本轮完成
  * 3) already_running 时延迟再试，避免关页后无人接棒
- * 4) 额外发 1 次 HTTP continue 作兜底（外部 cron 仍是最终保险）
+ * 4) 额外发 1 次 HTTP continue 作兜底（cron-worker 每分钟 resume 为最终保险）
  */
 function scheduleContinueIfNeeded(context, request, result) {
   if (!result || !result.needContinue || !context.waitUntil) return;
@@ -1927,7 +1927,7 @@ async function handleScheduleStart(context) {
     cfg = await getScheduleConfig(env);
     return jsonResponse({
       success: true,
-      msg: '服务端定时已启动。关页后请用外部 cron 每分钟访问 /api/schedule/run，否则无法到点执行。',
+      msg: '服务端定时已启动。关页后由 cron-worker（CF Cron）或 GitHub Actions 每分钟触发 /api/schedule/run。',
       config: cfg,
       run: runResult
     });

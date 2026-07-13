@@ -1,0 +1,45 @@
+# 关页定时兜底：GitHub Actions 每分钟请求 Pages /api/schedule/run
+# 与 cron-worker（CF Cron Trigger）二选一或同时用均可。
+# 优先推荐 cron-worker（与参考项目 heyun-zjmf-worker-monitor 相同，纯 CF 内闭环）。
+#
+# 配置：仓库 Settings → Secrets → Actions
+#   PAGES_URL = https://你的项目.pages.dev   （不要末尾斜杠）
+# 可选：
+#   CRON_SECRET = 与 Pages 环境变量 CRON_SECRET 一致
+
+name: Schedule Cron (Pages)
+
+on:
+  schedule:
+    # 每分钟（GitHub 实际可能 1～5 分钟抖动，作兜底足够）
+    - cron: '* * * * *'
+  workflow_dispatch:
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: POST /api/schedule/run
+        env:
+          PAGES_URL: ${{ secrets.PAGES_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$PAGES_URL" ]; then
+            echo "PAGES_URL secret 未配置，跳过。请在仓库 Secrets 填入 Pages 根地址。"
+            exit 0
+          fi
+          BASE="${PAGES_URL%/}"
+          URL="${BASE}/api/schedule/run"
+          HDR=(-H "Content-Type: application/json" -H "User-Agent: github-actions-schedule-cron/1.0" -H "X-Schedule-Cron: 1")
+          if [ -n "$CRON_SECRET" ]; then
+            HDR+=(-H "X-Cron-Secret: ${CRON_SECRET}")
+          fi
+          echo "POST $URL"
+          code=$(curl -sS -o /tmp/sched_out.json -w "%{http_code}" -X POST "${HDR[@]}" -d '{}' "$URL" || echo "000")
+          echo "HTTP $code"
+          head -c 500 /tmp/sched_out.json 2>/dev/null || true
+          echo
+          if [ "$code" != "200" ] && [ "$code" != "000" ]; then
+            echo "warn: non-200 response"
+          fi
