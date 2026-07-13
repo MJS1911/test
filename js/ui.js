@@ -360,11 +360,6 @@ document.addEventListener('keydown', function(e) {
 
 // ==================== 系统日志窗口 ====================
 
-function clearLogs() {
-    const logContent = document.getElementById('logContent');
-    if (logContent) logContent.innerHTML = '';
-}
-
 function openLogPanel() {
     const panel = document.getElementById('logPanel');
     if (!panel) return;
@@ -380,6 +375,11 @@ function closeLogPanel() {
     panel.style.display = 'none';
 }
 
+function clearLogs() {
+    const logContent = document.getElementById('logContent');
+    if (logContent) logContent.innerHTML = '';
+}
+
 function toggleLogPanel() {
     const panel = document.getElementById('logPanel');
     if (!panel) return;
@@ -389,6 +389,12 @@ function toggleLogPanel() {
         openLogPanel();
     }
 }
+
+// 立即挂到 window，避免后续脚本异常导致末尾绑定未执行
+window.openLogPanel = openLogPanel;
+window.closeLogPanel = closeLogPanel;
+window.clearLogs = clearLogs;
+window.toggleLogPanel = toggleLogPanel;
 
 /** 日志浮窗拖动（标题栏拖拽） */
 let _logDragBound = false;
@@ -518,6 +524,10 @@ function toggleTheme(event) {
         if (_themeAnimating) done();
     }, 700);
 }
+
+// 立即挂到 window，保证 onclick 可用
+window.toggleTheme = toggleTheme;
+window.applyTheme = applyTheme;
 
 // 尽早应用主题，减少闪烁
 initTheme();

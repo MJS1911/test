@@ -1076,31 +1076,42 @@ body {
         padding: 4px 10px;
         font-size: 0.75rem;
     }
-    .topbar-icon-btn {
-        width: 34px;
-        height: 34px;
-        min-width: 34px;
-        padding: 0;
+    .topbar-icon-btn,
+    #btnLog {
+        width: 34px !important;
+        height: 34px !important;
+        min-width: 34px !important;
+        max-width: 34px;
+        padding: 0 !important;
+        border-radius: 50% !important;
         font-size: 0.75rem;
     }
-    .theme-toggle-btn {
-        width: 34px;
-        height: 34px;
+    .theme-toggle-btn,
+    #btnThemeToggle {
+        width: 34px !important;
+        height: 34px !important;
+        min-width: 34px !important;
+        max-width: 34px;
+        border-radius: 50% !important;
     }
 }
 
 /* ==================== 顶栏图标/日志按钮（圆形，与主题按钮统一） ==================== */
-.topbar-icon-btn {
+.topbar-icon-btn,
+button.topbar-icon-btn,
+#btnLog {
     position: relative;
-    display: inline-flex;
+    display: inline-flex !important;
     align-items: center;
     justify-content: center;
-    width: 38px;
-    height: 38px;
-    min-width: 38px;
-    padding: 0;
+    width: 38px !important;
+    height: 38px !important;
+    min-width: 38px !important;
+    max-width: 38px;
+    padding: 0 !important;
     border: 1px solid var(--border);
-    border-radius: 50%;
+    border-radius: 50% !important;
+    -webkit-border-radius: 50% !important;
     background: linear-gradient(145deg, var(--card-bg), var(--muted-surface));
     color: var(--text-muted);
     cursor: pointer;
@@ -1111,6 +1122,7 @@ body {
     line-height: 1;
     overflow: hidden;
     box-shadow: var(--shadow);
+    box-sizing: border-box;
 }
 .topbar-icon-btn:hover {
     background: var(--hover-bg);
@@ -1133,23 +1145,29 @@ html.dark .topbar-icon-btn {
 }
 
 /* ==================== 主题切换按钮 ==================== */
-.theme-toggle-btn {
+.theme-toggle-btn,
+button.theme-toggle-btn,
+#btnThemeToggle {
     position: relative;
-    display: inline-flex;
+    display: inline-flex !important;
     align-items: center;
     justify-content: center;
-    width: 38px;
-    height: 38px;
+    width: 38px !important;
+    height: 38px !important;
+    min-width: 38px !important;
+    max-width: 38px;
     border: 1px solid var(--border);
-    border-radius: 50%;
+    border-radius: 50% !important;
+    -webkit-border-radius: 50% !important;
     background: linear-gradient(145deg, var(--card-bg), var(--muted-surface));
     color: var(--text-muted);
     cursor: pointer;
     transition: background 0.25s, border-color 0.25s, box-shadow 0.25s, transform 0.15s;
     flex-shrink: 0;
-    padding: 0;
+    padding: 0 !important;
     overflow: hidden;
     box-shadow: var(--shadow);
+    box-sizing: border-box;
 }
 .theme-toggle-btn:hover {
     border-color: var(--primary);

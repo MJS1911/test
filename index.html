@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>魔方财务自动化开机管理平台</title>
-    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="css/style.css?v=20260714b">
     <script>
     (function () {
         try {
@@ -32,10 +32,14 @@
             </div>
             <div class="topbar-right">
                 <span class="topbar-status" id="topbarStatus">未连接</span>
-                <button type="button" class="topbar-icon-btn" id="btnLog" title="系统日志" aria-label="系统日志">
+                <button type="button" class="topbar-icon-btn" id="btnLog" title="系统日志" aria-label="系统日志"
+                    style="width:38px;height:38px;min-width:38px;padding:0;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;overflow:hidden;"
+                    onclick="if(typeof openLogPanel==='function'){openLogPanel();}else if(window.openLogPanel){window.openLogPanel();}">
                     <span class="topbar-icon">📋</span>
                 </button>
-                <button type="button" class="theme-toggle-btn" id="btnThemeToggle" title="切换夜间/白天模式" aria-label="切换主题">
+                <button type="button" class="theme-toggle-btn" id="btnThemeToggle" title="切换夜间/白天模式" aria-label="切换主题"
+                    style="width:38px;height:38px;min-width:38px;padding:0;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;overflow:hidden;"
+                    onclick="if(typeof toggleTheme==='function'){toggleTheme(event);}else if(window.toggleTheme){window.toggleTheme(event);}">
                     <span class="theme-icon theme-icon-sun" aria-hidden="true">☀️</span>
                     <span class="theme-icon theme-icon-moon" aria-hidden="true">🌙</span>
                 </button>
@@ -253,10 +257,10 @@
         <div class="log-content" id="logContent"></div>
     </div>
 
-    <script src="js/api.js"></script>
-    <script src="js/adminAuth.js"></script>
-    <script src="js/ui.js"></script>
-    <script src="js/operations.js"></script>
+    <script src="js/api.js?v=20260714b"></script>
+    <script src="js/adminAuth.js?v=20260714b"></script>
+    <script src="js/ui.js?v=20260714b"></script>
+    <script src="js/operations.js?v=20260714b"></script>
     <script>
     // ==================== 服务商标签栏管理 ====================
 
