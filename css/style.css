@@ -527,11 +527,54 @@ body {
     .toast { min-width: auto; max-width: calc(100vw - 40px); }
 }
 
+/* ==================== 定时操作 ==================== */
+.schedule-ops {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+}
+
+.schedule-ops-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin-bottom: 6px;
+    color: var(--text);
+}
+
+.schedule-ops-desc {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    line-height: 1.45;
+    margin-bottom: 10px;
+}
+
+.schedule-interval-group {
+    margin-bottom: 10px;
+}
+
+.schedule-interval-group input {
+    width: 100%;
+}
+
+.schedule-status {
+    margin-top: 8px;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    line-height: 1.4;
+    min-height: 1.2em;
+}
+
+.schedule-status.running {
+    color: var(--success);
+}
+
 /* ==================== 系统日志浮窗 ==================== */
 .log-panel {
     position: fixed;
-    top: 72px;
+    top: auto;
+    bottom: 20px;
     right: 20px;
+    left: auto;
     width: 420px;
     max-width: calc(100vw - 32px);
     height: 320px;

@@ -265,6 +265,296 @@ async function pollStatusAfterOperation(hostId, maxAttempts = 15, interval = 300
     showToast('轮询超时，请手动点击查询状态按钮刷新', 'warning');
 }
 
+// ==================== 定时操作（查状态 + 硬重启/重启兜底） ====================
+
+/** 按服务商记忆的定时配置与运行态 */
+const SCHEDULE_STORAGE_KEY = 'mofang_schedule_ops';
+let scheduleTimer = null;
+let scheduleRunning = false;
+let scheduleTickBusy = false;
+let scheduleProviderId = null;
+let scheduleIntervalMin = 5;
+let scheduleLastRunAt = null;
+let scheduleNextRunAt = null;
+
+function _scheduleStorageLoad() {
+    try {
+        return JSON.parse(localStorage.getItem(SCHEDULE_STORAGE_KEY) || '{}') || {};
+    } catch (e) {
+        return {};
+    }
+}
+
+function _scheduleStorageSave(map) {
+    try {
+        localStorage.setItem(SCHEDULE_STORAGE_KEY, JSON.stringify(map || {}));
+    } catch (e) { /* ignore */ }
+}
+
+function getScheduleProviderKey() {
+    if (typeof activePid !== 'undefined' && activePid) return String(activePid);
+    return scheduleProviderId || 'default';
+}
+
+function loadScheduleConfigForActive() {
+    const key = getScheduleProviderKey();
+    const map = _scheduleStorageLoad();
+    const cfg = map[key] || {};
+    const input = document.getElementById('scheduleInterval');
+    if (input && cfg.intervalMin) {
+        input.value = String(cfg.intervalMin);
+    }
+    return cfg;
+}
+
+function saveScheduleConfigForActive(partial) {
+    const key = getScheduleProviderKey();
+    const map = _scheduleStorageLoad();
+    map[key] = Object.assign({}, map[key] || {}, partial || {});
+    _scheduleStorageSave(map);
+}
+
+function formatScheduleTime(ts) {
+    if (!ts) return '-';
+    const d = new Date(ts);
+    return String(d.getHours()).padStart(2, '0') + ':' +
+        String(d.getMinutes()).padStart(2, '0') + ':' +
+        String(d.getSeconds()).padStart(2, '0');
+}
+
+function updateScheduleUI() {
+    const statusEl = document.getElementById('scheduleStatus');
+    const btnStart = document.getElementById('btnScheduleStart');
+    const btnStop = document.getElementById('btnScheduleStop');
+    const input = document.getElementById('scheduleInterval');
+
+    if (btnStart) btnStart.disabled = scheduleRunning;
+    if (btnStop) btnStop.disabled = !scheduleRunning;
+    if (input) input.disabled = scheduleRunning;
+
+    if (!statusEl) return;
+    if (!scheduleRunning) {
+        statusEl.textContent = '未启动';
+        statusEl.className = 'schedule-status';
+        return;
+    }
+    let text = '运行中 · 间隔 ' + scheduleIntervalMin + ' 分钟';
+    if (scheduleLastRunAt) text += ' · 上次 ' + formatScheduleTime(scheduleLastRunAt);
+    if (scheduleNextRunAt) text += ' · 下次 ' + formatScheduleTime(scheduleNextRunAt);
+    if (scheduleTickBusy) text += ' · 检查中…';
+    statusEl.textContent = text;
+    statusEl.className = 'schedule-status running';
+}
+
+/**
+ * 判断是否为「运行中/开机」
+ * API status === 'on' 视为运行中
+ */
+function isHostRunning(statusData) {
+    if (!statusData) return false;
+    const s = String(statusData.status || '').toLowerCase();
+    return s === 'on' || s === 'running' || s === 'online';
+}
+
+/**
+ * 对非运行中主机：优先硬重启，失败则重启
+ */
+async function recoverHostWithReboot(hostId) {
+    try {
+        const hard = await performOperation(hostId, 'hard_reboot');
+        if (hard && hard.success && !hard.needVerify) {
+            log('success', '定时操作: 硬重启成功 #' + hostId, hard.msg);
+            return { success: true, action: 'hard_reboot', msg: hard.msg };
+        }
+        // 需要二次验证时无法在定时任务中完成，记为失败并尝试普通重启
+        if (hard && hard.needVerify) {
+            log('warning', '定时操作: 硬重启需二次验证，改试重启 #' + hostId);
+        } else {
+            log('warning', '定时操作: 硬重启失败，改试重启 #' + hostId, hard && hard.error);
+        }
+    } catch (e) {
+        log('warning', '定时操作: 硬重启异常，改试重启 #' + hostId, e.message);
+    }
+
+    try {
+        const soft = await performOperation(hostId, 'reboot');
+        if (soft && soft.success && !soft.needVerify) {
+            log('success', '定时操作: 重启成功 #' + hostId, soft.msg);
+            return { success: true, action: 'reboot', msg: soft.msg };
+        }
+        return {
+            success: false,
+            action: 'reboot',
+            error: (soft && (soft.error || soft.msg)) || '重启失败'
+        };
+    } catch (e) {
+        return { success: false, action: 'reboot', error: e.message };
+    }
+}
+
+/**
+ * 一轮定时检查：查全部状态，非运行中则硬重启→重启兜底
+ */
+async function runScheduledCheck() {
+    if (scheduleTickBusy) return;
+    if (!API.jwt || !API.hosts || API.hosts.length === 0) {
+        log('warning', '定时操作: 未登录或无服务器，跳过本轮');
+        scheduleLastRunAt = Date.now();
+        scheduleNextRunAt = Date.now() + scheduleIntervalMin * 60 * 1000;
+        updateScheduleUI();
+        return;
+    }
+
+    scheduleTickBusy = true;
+    updateScheduleUI();
+    log('info', '定时操作: 开始检查', '共 ' + API.hosts.length + ' 台');
+
+    let checked = 0, running = 0, recovered = 0, failed = 0;
+
+    try {
+        for (const host of API.hosts) {
+            if (!scheduleRunning) break;
+            const hostId = host.id;
+            if (!hostId) continue;
+
+            try {
+                const result = await fetchServerStatus(hostId);
+                if (result.success) {
+                    updateStatusCell(hostId, getPowerStatusBadge(hostId));
+                    checked++;
+                    if (isHostRunning(result.data)) {
+                        running++;
+                    } else {
+                        const des = (result.data && (result.data.des || result.data.status)) || '非运行中';
+                        log('warning', '定时操作: #' + hostId + ' 非运行中 (' + des + ')，尝试恢复');
+                        const rec = await recoverHostWithReboot(hostId);
+                        if (rec.success) {
+                            recovered++;
+                            // 操作后稍等再刷一次状态
+                            await sleep(800);
+                            try {
+                                const st2 = await fetchServerStatus(hostId);
+                                if (st2.success) updateStatusCell(hostId, getPowerStatusBadge(hostId));
+                            } catch (e2) { /* ignore */ }
+                        } else {
+                            failed++;
+                            log('error', '定时操作: #' + hostId + ' 恢复失败', rec.error);
+                        }
+                    }
+                } else {
+                    failed++;
+                    updateStatusCell(hostId, '<span class="status-badge off">❌ ' + escapeHtml(result.error) + '</span>');
+                    log('error', '定时操作: 查状态失败 #' + hostId, result.error);
+                }
+            } catch (e) {
+                failed++;
+                updateStatusCell(hostId, '<span class="status-badge off">❌ ' + escapeHtml(e.message) + '</span>');
+                log('error', '定时操作: 异常 #' + hostId, e.message);
+            }
+
+            await sleep(250);
+        }
+    } finally {
+        scheduleTickBusy = false;
+        scheduleLastRunAt = Date.now();
+        scheduleNextRunAt = Date.now() + scheduleIntervalMin * 60 * 1000;
+        updateScheduleUI();
+        const summary = '检查 ' + checked + ' · 运行中 ' + running + ' · 已恢复 ' + recovered + ' · 失败 ' + failed;
+        log('info', '定时操作: 本轮完成', summary);
+        if (typeof showToast === 'function') {
+            showToast('定时检查完成: ' + summary, failed > 0 ? 'warning' : 'success');
+        }
+    }
+}
+
+function startScheduledOps() {
+    if (scheduleRunning) {
+        showToast('定时操作已在运行', 'info');
+        return;
+    }
+    if (!API.jwt || !API.hosts || API.hosts.length === 0) {
+        showToast('请先登录并加载服务器列表', 'warning');
+        return;
+    }
+
+    const input = document.getElementById('scheduleInterval');
+    let mins = parseInt(input && input.value, 10);
+    if (!mins || mins < 1) mins = 1;
+    if (mins > 1440) mins = 1440;
+    if (input) input.value = String(mins);
+
+    scheduleIntervalMin = mins;
+    scheduleProviderId = getScheduleProviderKey();
+    scheduleRunning = true;
+    scheduleLastRunAt = null;
+    scheduleNextRunAt = Date.now();
+
+    saveScheduleConfigForActive({ intervalMin: mins, enabled: true });
+
+    if (scheduleTimer) {
+        clearInterval(scheduleTimer);
+        scheduleTimer = null;
+    }
+
+    // 立即执行一轮，再按间隔循环
+    runScheduledCheck();
+    scheduleTimer = setInterval(function () {
+        if (!scheduleRunning) return;
+        runScheduledCheck();
+    }, scheduleIntervalMin * 60 * 1000);
+
+    updateScheduleUI();
+    showToast('定时操作已启动，间隔 ' + mins + ' 分钟', 'success');
+    log('info', '定时操作已启动', '间隔 ' + mins + ' 分钟, provider=' + scheduleProviderId);
+}
+
+function stopScheduledOps(silent) {
+    const wasRunning = scheduleRunning;
+    scheduleRunning = false;
+    if (scheduleTimer) {
+        clearInterval(scheduleTimer);
+        scheduleTimer = null;
+    }
+    scheduleTickBusy = false;
+    scheduleNextRunAt = null;
+    saveScheduleConfigForActive({ enabled: false, intervalMin: scheduleIntervalMin });
+    updateScheduleUI();
+    if (wasRunning) {
+        log('info', '定时操作已停止');
+        if (!silent && typeof showToast === 'function') {
+            showToast('定时操作已停止', 'info');
+        }
+    }
+}
+
+/**
+ * 切换服务商时：停止当前定时器并恢复该服务商的间隔配置
+ * （定时任务绑定当前活跃服务商，切换后需重新启动）
+ */
+function onProviderSwitchForSchedule() {
+    if (scheduleRunning) {
+        stopScheduledOps(true);
+        if (typeof showToast === 'function') {
+            showToast('已切换服务商，定时操作已自动停止，请按需重新启动', 'info');
+        }
+    }
+    loadScheduleConfigForActive();
+    updateScheduleUI();
+}
+
+// 页面加载时恢复间隔显示
+if (typeof document !== 'undefined') {
+    document.addEventListener('DOMContentLoaded', function () {
+        loadScheduleConfigForActive();
+        updateScheduleUI();
+    });
+}
+
+window.startScheduledOps = startScheduledOps;
+window.stopScheduledOps = stopScheduledOps;
+window.runScheduledCheck = runScheduledCheck;
+window.onProviderSwitchForSchedule = onProviderSwitchForSchedule;
+
 // ==================== 工具函数 ====================
 
 function sleep(ms) {

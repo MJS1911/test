@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>魔方财务自动化开机管理平台</title>
-    <link rel="stylesheet" href="css/style.css?v=20260714c">
+    <link rel="stylesheet" href="css/style.css?v=20260714d">
     <script>
     (function () {
         try {
@@ -90,6 +90,19 @@
                 <div class="batch-buttons" style="margin-top:8px;">
                     <button class="btn btn-outline btn-sm" onclick="batchOperation('hard_off')">全部硬关机</button>
                     <button class="btn btn-outline btn-sm" onclick="refreshAllStatus()">刷新全部状态</button>
+                </div>
+                <div class="schedule-ops" id="scheduleOps">
+                    <h3 class="schedule-ops-title">⏱ 定时操作</h3>
+                    <p class="schedule-ops-desc">按间隔检查本服务商全部服务器；非运行中优先硬重启，失败则重启。</p>
+                    <div class="form-group schedule-interval-group">
+                        <label for="scheduleInterval">检查间隔（分钟）</label>
+                        <input type="number" id="scheduleInterval" min="1" max="1440" value="5" step="1">
+                    </div>
+                    <div class="batch-buttons">
+                        <button type="button" class="btn btn-success btn-sm" id="btnScheduleStart" onclick="startScheduledOps()">启动定时</button>
+                        <button type="button" class="btn btn-outline btn-sm" id="btnScheduleStop" onclick="stopScheduledOps()" disabled>停止</button>
+                    </div>
+                    <div class="schedule-status" id="scheduleStatus">未启动</div>
                 </div>
                 <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
                     <button class="btn btn-outline btn-sm btn-block" onclick="openChangePasswordDialog()">🔑 修改管理密码</button>
@@ -257,10 +270,10 @@
         <div class="log-content" id="logContent"></div>
     </div>
 
-    <script src="js/api.js?v=20260714c"></script>
-    <script src="js/adminAuth.js?v=20260714c"></script>
-    <script src="js/ui.js?v=20260714c"></script>
-    <script src="js/operations.js?v=20260714c"></script>
+    <script src="js/api.js?v=20260714d"></script>
+    <script src="js/adminAuth.js?v=20260714d"></script>
+    <script src="js/ui.js?v=20260714d"></script>
+    <script src="js/operations.js?v=20260714d"></script>
     <script>
     // ==================== 服务商标签栏管理 ====================
 
@@ -356,10 +369,27 @@
         updateLoginFields(p);
     }
 
-    /** 切换服务商 */
+    /** 切换服务商（再次点击当前标签也会刷新全部状态） */
     async function switchProvider(pid) {
-        if (pid === activePid) return;
+        // 已是当前服务商：直接刷新全部状态
+        if (pid === activePid) {
+            if (API.jwt && API.hosts && API.hosts.length > 0 && typeof refreshAllStatus === 'function') {
+                await refreshAllStatus();
+            } else if (API.jwt && typeof loadServers === 'function') {
+                await loadServers();
+                if (API.hosts && API.hosts.length > 0 && typeof refreshAllStatus === 'function') {
+                    await refreshAllStatus();
+                }
+            } else {
+                showToast('请先连接服务商', 'warning');
+            }
+            return;
+        }
         try {
+            // 切换前停止当前服务商的定时任务
+            if (typeof onProviderSwitchForSchedule === 'function') {
+                onProviderSwitchForSchedule();
+            }
             const resp = await fetch('/api/provider/active', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -373,6 +403,10 @@
                 updateActiveProviderInfo();
                 // 重新登录并加载服务器
                 await autoRelogin();
+                // 进入该服务商标签后自动刷新全部状态
+                if (API.jwt && API.hosts && API.hosts.length > 0 && typeof refreshAllStatus === 'function') {
+                    await refreshAllStatus();
+                }
                 showToast('已切换到: ' + (providerList.find(p => p.id === pid) || {}).name, 'success');
             } else {
                 showToast('切换失败: ' + (result.error || '未知错误'), 'error');
