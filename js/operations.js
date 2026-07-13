@@ -267,8 +267,8 @@ async function pollStatusAfterOperation(hostId, maxAttempts = 15, interval = 300
 
 // ==================== 服务端长效定时（CF Pages KV，关网页不停） ====================
 // 配置与执行均在服务端 /api/schedule/*；前端只负责启停与展示状态。
-// 巡检覆盖全部服务商全部机器；非运行中 hard_reboot → 失败则 reboot。
-// 关页后必须有外部 cron 每分钟访问 /api/schedule/run，否则到点不会执行。
+// 巡检覆盖全部服务商全部机器；关机优先 on，其它 hard_reboot→reboot→on。
+// 关页后服务端 waitUntil 会连续分片续跑；仍须外部 cron 每分钟访问 /api/schedule/run 作兜底。
 
 let scheduleConfig = {
     enabled: false,

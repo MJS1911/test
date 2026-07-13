@@ -935,15 +935,15 @@ const SCHEDULE_DEFAULT_INTERVAL = 5;
 const SCHEDULE_MIN_INTERVAL = 1;
 const SCHEDULE_MAX_INTERVAL = 1440;
 /** 单次调用时间预算(ms)：留足写 KV 余量，避免硬超时丢进度；到期后 yielded 让出 */
-const SCHEDULE_TIME_BUDGET_MS = 14000;
+const SCHEDULE_TIME_BUDGET_MS = 16000;
 /** 卡住 running 超过此时长则强制解锁续跑 */
-const SCHEDULE_STALE_MS = 90 * 1000;
+const SCHEDULE_STALE_MS = 60 * 1000;
 /** 主机间最小间隔，避免打爆目标站 */
-const SCHEDULE_HOST_GAP_MS = 30;
+const SCHEDULE_HOST_GAP_MS = 20;
 /** 并发锁：running 且未 yielded 时，心跳在此时间内视为「有人在跑」 */
-const SCHEDULE_LOCK_MS = 20000;
-/** waitUntil 后台最多续跑跳数（每跳可再处理若干台） */
-const SCHEDULE_CONTINUE_MAX_HOPS = 20;
+const SCHEDULE_LOCK_MS = 12000;
+/** waitUntil 后台最多续跑跳数；用尽后 hop 归零继续，关页无前端也能跑完 */
+const SCHEDULE_CONTINUE_MAX_HOPS = 40;
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -1162,76 +1162,75 @@ function extractOpError(resp, fallback) {
   return fallback || '操作失败';
 }
 
+/** 状态文案是否明确为关机/关闭（此类机硬重启/重启常无效，优先开机） */
+function isHostClearlyOff(data) {
+  if (!data) return false;
+  const s = String(data.status || '').toLowerCase();
+  if (s === 'off' || s === 'stopped' || s === 'shutdown' || s === 'poweroff' || s === 'powered_off') return true;
+  const des = String(data.des || data.description || '').toLowerCase();
+  if (des.includes('关机') || des.includes('关闭') || des.includes('已停止') || des === 'off') return true;
+  return false;
+}
+
 /**
- * 恢复单机：hard_reboot → 失败再 reboot → 再失败则 on（开机）
- * 部分关机机器不支持重启/硬重启，只能开机
+ * 恢复单机：
+ * - 明确关机态：优先 on（关机机 hard/soft 重启常无效，省时间便于关页全量）
+ * - 其它非运行：hard_reboot → reboot → on
  */
-async function serverRecoverHost(providerBase, jwt, hostId) {
+async function serverRecoverHost(providerBase, jwt, hostId, statusData) {
   const prevErrs = [];
+  const preferOnFirst = isHostClearlyOff(statusData);
 
-  // 1) 硬重启
-  try {
-    const hardParams = new URLSearchParams();
-    hardParams.append('id', String(hostId));
-    hardParams.append('func', 'hard_reboot');
-    const hard = await serverApiRequest(providerBase, jwt, 'provision/default', 'POST', hardParams.toString(), true);
-    if (isProvisionOpSuccess(hard)) {
-      return { success: true, action: 'hard_reboot', msg: hard.msg || '硬重启成功' };
+  async function tryOp(func, label) {
+    try {
+      const params = new URLSearchParams();
+      params.append('id', String(hostId));
+      params.append('func', func);
+      const resp = await serverApiRequest(providerBase, jwt, 'provision/default', 'POST', params.toString(), true);
+      if (isProvisionOpSuccess(resp)) {
+        return {
+          ok: true,
+          result: {
+            success: true,
+            action: func,
+            msg: (resp.msg || (label + '成功')) + (prevErrs.length ? '（' + prevErrs.join('；') + '）' : '')
+          }
+        };
+      }
+      let err = extractOpError(resp, label + '失败');
+      if (resp && resp.data && resp.data._second_verify) err = label + '需二次验证';
+      prevErrs.push(label + ': ' + err);
+      return { ok: false };
+    } catch (e) {
+      prevErrs.push(label + ': ' + (e.message || label + '异常'));
+      return { ok: false };
     }
-    let hardErr = extractOpError(hard, '硬重启失败');
-    if (hard && hard.data && hard.data._second_verify) hardErr = '硬重启需二次验证';
-    prevErrs.push('硬重启: ' + hardErr);
-  } catch (e) {
-    prevErrs.push('硬重启: ' + (e.message || '硬重启异常'));
   }
 
-  // 2) 软重启
-  try {
-    const softParams = new URLSearchParams();
-    softParams.append('id', String(hostId));
-    softParams.append('func', 'reboot');
-    const soft = await serverApiRequest(providerBase, jwt, 'provision/default', 'POST', softParams.toString(), true);
-    if (isProvisionOpSuccess(soft)) {
-      return {
-        success: true,
-        action: 'reboot',
-        msg: (soft.msg || '重启成功') + (prevErrs.length ? '（' + prevErrs.join('；') + '）' : '')
-      };
-    }
-    let softErr = extractOpError(soft, '重启失败');
-    if (soft && soft.data && soft.data._second_verify) softErr = '重启需二次验证';
-    prevErrs.push('重启: ' + softErr);
-  } catch (e) {
-    prevErrs.push('重启: ' + (e.message || '重启异常'));
+  // 关机态：先开机
+  if (preferOnFirst) {
+    const onFirst = await tryOp('on', '开机');
+    if (onFirst.ok) return onFirst.result;
+    // 开机失败再走 hard → reboot → on（on 已试过，后面链仍含 on 兜底）
   }
 
-  // 3) 开机（关机态部分机只能 on）
-  try {
-    const onParams = new URLSearchParams();
-    onParams.append('id', String(hostId));
-    onParams.append('func', 'on');
-    const onResp = await serverApiRequest(providerBase, jwt, 'provision/default', 'POST', onParams.toString(), true);
-    if (isProvisionOpSuccess(onResp)) {
-      return {
-        success: true,
-        action: 'on',
-        msg: (onResp.msg || '开机成功') + (prevErrs.length ? '（' + prevErrs.join('；') + '）' : '')
-      };
-    }
-    let onErr = extractOpError(onResp, '开机失败');
-    if (onResp && onResp.data && onResp.data._second_verify) onErr = '开机需二次验证';
-    return {
-      success: false,
-      action: 'on',
-      error: onErr + (prevErrs.length ? '；' + prevErrs.join('；') : '')
-    };
-  } catch (e) {
-    return {
-      success: false,
-      action: 'on',
-      error: (e.message || '开机异常') + (prevErrs.length ? '；' + prevErrs.join('；') : '')
-    };
+  const hard = await tryOp('hard_reboot', '硬重启');
+  if (hard.ok) return hard.result;
+
+  const soft = await tryOp('reboot', '重启');
+  if (soft.ok) return soft.result;
+
+  // 若关机态已试过 on，避免重复；否则再试 on
+  if (!preferOnFirst) {
+    const onLast = await tryOp('on', '开机');
+    if (onLast.ok) return onLast.result;
   }
+
+  return {
+    success: false,
+    action: preferOnFirst ? 'on' : 'on',
+    error: (prevErrs.length ? prevErrs.join('；') : '恢复失败')
+  };
 }
 
 /** 拉取某服务商全部主机（分页） */
@@ -1644,7 +1643,7 @@ async function executeScheduleRound(env, options = {}) {
             } else {
               const des = data.des || data.status || '非运行中';
               logBuf.push('warning', '[' + pname + '] #' + hostId + ' 非运行中 (' + des + ')，尝试恢复');
-              const rec = await serverRecoverHost(cursor.baseUrl, cursor.jwt, hostId);
+              const rec = await serverRecoverHost(cursor.baseUrl, cursor.jwt, hostId, data);
               if (rec.success) {
                 stats.recovered++;
                 logBuf.push('success', '[' + pname + '] #' + hostId + ' ' + rec.action + ' 成功', rec.msg);
@@ -1771,46 +1770,97 @@ async function finishScheduleRound(env, cfgIn, stats, logBuf, emptyProviders) {
 }
 
 /**
- * 后台自续跑：waitUntil 再请求自己继续下一分片。
- * body 携带 continueCursor 快照，不依赖 KV 最终一致。
- * 每请求只挂 1 跳（下一跳自己再 waitUntil），避免 waitUntil 总时长超限。
- * 关页后靠外部 cron 每分钟 /api/schedule/run 自动 resume。
+ * 后台自续跑（关页全量关键路径）：
+ * 1) 优先在 waitUntil 内直接循环 executeScheduleRound（不依赖 HTTP 自调用，更可靠）
+ * 2) 每跳仍带 bodyCursor 快照；hop 用尽后归零继续，直到本轮完成
+ * 3) already_running 时延迟再试，避免关页后无人接棒
+ * 4) 额外发 1 次 HTTP continue 作兜底（外部 cron 仍是最终保险）
  */
 function scheduleContinueIfNeeded(context, request, result) {
   if (!result || !result.needContinue || !context.waitUntil) return;
-  // 已被其他 worker 占用时不要空转 waitUntil（等锁过期由 cron/前端再触发）
-  if (result.skipped && result.reason === 'already_running') return;
-  const hop = Math.max(0, parseInt(result.hop, 10) || 0);
-  if (hop >= SCHEDULE_CONTINUE_MAX_HOPS) return;
+  const env = context.env;
+  if (!env) return;
+
+  const initialHop = Math.max(0, parseInt(result.hop, 10) || 0);
+  let cursorSnap = result.continueCursor || null;
+  const isLocked = !!(result.skipped && result.reason === 'already_running');
+
+  context.waitUntil(
+    (async () => {
+      try {
+        // 等本请求 KV 写尽量可见
+        await sleepMs(isLocked ? Math.min(SCHEDULE_LOCK_MS, 3000) : 200);
+
+        let hop = initialHop;
+        // 后台最多再跑这么多分片；每分片约 16s，CF waitUntil 可能中途截断，截断后靠 cron resume
+        const maxLoops = SCHEDULE_CONTINUE_MAX_HOPS;
+        for (let i = 0; i < maxLoops; i++) {
+          hop = hop + 1;
+          // hop 计数仅用于日志；超过上限归零，绝不因 hop 停链
+          if (hop > SCHEDULE_CONTINUE_MAX_HOPS) hop = 1;
+
+          let next;
+          try {
+            next = await executeScheduleRound(env, {
+              isContinue: true,
+              bodyCursor: cursorSnap,
+              hop
+            });
+          } catch (err) {
+            console.warn('schedule bg continue execute error:', err);
+            // 失败再试一次 HTTP 兜底
+            try {
+              await scheduleHttpContinueOnce(request, cursorSnap, hop);
+            } catch (_) { /* ignore */ }
+            break;
+          }
+
+          if (!next) break;
+
+          if (next.continueCursor) cursorSnap = next.continueCursor;
+
+          // 本轮已完成
+          if (!next.needContinue) break;
+
+          // 被其他 worker 占用：稍等再抢
+          if (next.skipped && next.reason === 'already_running') {
+            await sleepMs(Math.min(SCHEDULE_LOCK_MS, 2500));
+            continue;
+          }
+
+          // claim 丢失：用最新 cursor 再试
+          if (next.skipped && next.reason === 'claim_lost') {
+            await sleepMs(300);
+            continue;
+          }
+
+          // 正常 partial：极短间隔进入下一分片
+          await sleepMs(150);
+        }
+      } catch (e) {
+        console.warn('scheduleContinueIfNeeded bg loop error:', e);
+      }
+    })()
+  );
+}
+
+/** HTTP 自调用 continue 兜底（单次） */
+async function scheduleHttpContinueOnce(request, cursor, hop) {
   try {
     const base = new URL(request.url);
     const contUrl = new URL(base.pathname, base.origin);
     contUrl.searchParams.set('continue', '1');
-    contUrl.searchParams.set('hop', String(hop + 1));
-    const bodyPayload = JSON.stringify({
-      cursor: result.continueCursor || null,
-      hop: hop + 1
+    contUrl.searchParams.set('hop', String(hop || 1));
+    await fetch(contUrl.toString(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Schedule-Continue': '1'
+      },
+      body: JSON.stringify({ cursor: cursor || null, hop: hop || 1 })
     });
-    context.waitUntil(
-      (async () => {
-        // 稍等让本请求的 KV 写尽量可见；失败也不影响 body.cursor
-        await new Promise(r => setTimeout(r, 250));
-        try {
-          await fetch(contUrl.toString(), {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'X-Schedule-Continue': '1'
-            },
-            body: bodyPayload
-          });
-        } catch (err) {
-          console.warn('schedule continue fetch failed:', err);
-        }
-      })()
-    );
-  } catch (e) {
-    console.warn('scheduleContinueIfNeeded error:', e);
+  } catch (err) {
+    console.warn('scheduleHttpContinueOnce failed:', err);
   }
 }
 
