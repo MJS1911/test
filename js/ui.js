@@ -293,23 +293,26 @@ function updateStatusCell(hostId, html) {
 let pendingOperation = null;  // { hostId, operation }
 
 function openModal(title, body, confirmText) {
-    DOM.modalTitle.textContent = title;
-    DOM.modalBody.innerHTML = body;
-    DOM.modalConfirmBtn.textContent = confirmText || '确认执行';
+    if (!DOM.modalOverlay) return;
+    if (DOM.modalTitle) DOM.modalTitle.textContent = title;
+    if (DOM.modalBody) DOM.modalBody.innerHTML = body;
+    if (DOM.modalConfirmBtn) DOM.modalConfirmBtn.textContent = confirmText || '确认执行';
     DOM.modalOverlay.style.display = 'flex';
 }
 
 function closeModal() {
-    DOM.modalOverlay.style.display = 'none';
+    if (DOM.modalOverlay) DOM.modalOverlay.style.display = 'none';
     pendingOperation = null;
 }
 
-// 点击遮罩关闭
-DOM.modalOverlay.addEventListener('click', function(e) {
-    if (e.target === DOM.modalOverlay) {
-        closeModal();
-    }
-});
+// 点击遮罩关闭（null 安全，避免阻断后续日志/主题函数定义）
+if (DOM.modalOverlay) {
+    DOM.modalOverlay.addEventListener('click', function(e) {
+        if (e.target === DOM.modalOverlay) {
+            closeModal();
+        }
+    });
+}
 
 // ==================== Toast 通知 ====================
 
@@ -328,6 +331,7 @@ function showToast(message, type) {
         '<span class="toast-message">' + escapeHtml(message) + '</span>' +
         '<button class="toast-close" onclick="this.parentElement.remove()">✕</button>';
 
+    if (!DOM.toastContainer) return;
     DOM.toastContainer.appendChild(toast);
 
     // 3秒后自动消失
@@ -344,12 +348,12 @@ function showToast(message, type) {
 
 document.addEventListener('keydown', function(e) {
     // Enter 键登录
-    if (e.key === 'Enter' && document.activeElement === DOM.apiKey) {
+    if (e.key === 'Enter' && DOM.apiKey && document.activeElement === DOM.apiKey) {
         e.preventDefault();
         doLogin();
     }
     // Escape 关闭弹窗
-    if (e.key === 'Escape' && DOM.modalOverlay.style.display === 'flex') {
+    if (e.key === 'Escape' && DOM.modalOverlay && DOM.modalOverlay.style.display === 'flex') {
         closeModal();
     }
 });
@@ -707,5 +711,71 @@ if (DOM.adminPasswordInput) {
     } catch (e) {
         // KV 未配置或网络异常，静默处理
         console.log('[UI] 凭证加载跳过:', e.message);
+    }
+})();
+
+// ==================== 全局导出 + 事件绑定（CF/严格模式兜底） ====================
+// onclick 属性依赖 window 全局函数；显式挂载 + addEventListener 双保险
+(function bindGlobalUIFunctions() {
+    var exports = {
+        openLogPanel: openLogPanel,
+        closeLogPanel: closeLogPanel,
+        clearLogs: clearLogs,
+        toggleLogPanel: toggleLogPanel,
+        toggleTheme: toggleTheme,
+        applyTheme: applyTheme,
+        openModal: openModal,
+        closeModal: closeModal,
+        showToast: showToast,
+        loadServers: loadServers,
+        doLogin: doLogin,
+        doLogout: doLogout,
+        checkStatus: checkStatus
+    };
+    for (var k in exports) {
+        if (Object.prototype.hasOwnProperty.call(exports, k)) {
+            window[k] = exports[k];
+        }
+    }
+
+    function bindTopbarButtons() {
+        var btnLog = document.getElementById('btnLog');
+        if (btnLog && !btnLog.dataset.bound) {
+            btnLog.dataset.bound = '1';
+            btnLog.addEventListener('click', function (e) {
+                e.preventDefault();
+                openLogPanel();
+            });
+        }
+        var btnTheme = document.getElementById('btnThemeToggle');
+        if (btnTheme && !btnTheme.dataset.bound) {
+            btnTheme.dataset.bound = '1';
+            btnTheme.addEventListener('click', function (e) {
+                e.preventDefault();
+                toggleTheme(e);
+            });
+        }
+        var logClose = document.querySelector('#logPanel .log-close-btn');
+        if (logClose && !logClose.dataset.bound) {
+            logClose.dataset.bound = '1';
+            logClose.addEventListener('click', function (e) {
+                e.preventDefault();
+                closeLogPanel();
+            });
+        }
+        var logClear = document.querySelector('#logPanel .log-controls .btn-outline:not(.log-close-btn)');
+        if (logClear && !logClear.dataset.bound) {
+            logClear.dataset.bound = '1';
+            logClear.addEventListener('click', function (e) {
+                e.preventDefault();
+                clearLogs();
+            });
+        }
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', bindTopbarButtons);
+    } else {
+        bindTopbarButtons();
     }
 })();
