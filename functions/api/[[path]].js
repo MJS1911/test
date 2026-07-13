@@ -5,9 +5,15 @@
  * 路由: /api/auth/save -> 保存登录凭证到 KV
  * 路由: /api/auth/load -> 从 KV 读取登录凭证
  * 路由: /api/auth/clear -> 清除 KV 中的登录凭证
- * 路由: /api/admin/verify -> 验证管理密码
- * 路由: /api/admin/change -> 修改管理密码
+ * 路由: /api/admin/check_init -> 检查站点管理员密码是否已初始化
+ * 路由: /api/admin/init -> 初始化站点管理员密码
+ * 路由: /api/admin/verify -> 验证站点管理员密码（登录）
+ * 路由: /api/admin/change -> 修改站点管理员密码
  * 路由: /api/admin/check -> 检查是否已验证管理密码
+ * 路由: /api/provider/list -> 获取服务商列表
+ * 路由: /api/provider/save -> 保存（新增/编辑）服务商
+ * 路由: /api/provider/delete -> 删除服务商
+ * 路由: /api/provider/active -> 设置活跃服务商
  * 
  * 部署后可用地址: https://<your-project>.pages.dev/api/*
  * 
@@ -41,7 +47,13 @@ export async function onRequest(context) {
     return handleAuthClear(context);
   }
   
-  // ========== /api/admin/* 路由：管理密码验证 ==========
+  // ========== /api/admin/* 路由：站点管理员密码管理 ==========
+  if (path === '/admin/check_init' || path === '/admin/check_init/') {
+    return handleAdminCheckInit(context);
+  }
+  if (path === '/admin/init' || path === '/admin/init/') {
+    return handleAdminInit(context);
+  }
   if (path === '/admin/verify' || path === '/admin/verify/') {
     return handleAdminVerify(context);
   }
@@ -50,6 +62,20 @@ export async function onRequest(context) {
   }
   if (path === '/admin/check' || path === '/admin/check/') {
     return handleAdminCheck(context);
+  }
+  
+  // ========== /api/provider/* 路由：服务商管理 ==========
+  if (path === '/provider/list' || path === '/provider/list/') {
+    return handleProviderList(context);
+  }
+  if (path === '/provider/save' || path === '/provider/save/') {
+    return handleProviderSave(context);
+  }
+  if (path === '/provider/delete' || path === '/provider/delete/') {
+    return handleProviderDelete(context);
+  }
+  if (path === '/provider/active' || path === '/provider/active/') {
+    return handleProviderActive(context);
   }
   
   // ========== 常规 API 代理转发 ==========
@@ -292,40 +318,96 @@ async function handleAuthClear(context) {
   }
 }
 
-// ==================== 管理密码管理 ====================
+// ==================== 站点管理员密码管理（KV Key: site_admin_pwd） ====================
 
 /**
- * 默认管理密码
+ * 获取站点管理员密码（从 KV 读取，不存在返回 null）
  */
-const DEFAULT_ADMIN_PASSWORD = '1234560';
-
-/**
- * 获取管理密码（从 KV 读取，不存在则返回默认值）
- */
-async function getAdminPassword(env) {
-  if (!env.AUTH_KV) {
-    return DEFAULT_ADMIN_PASSWORD;
-  }
+async function getSiteAdminPassword(env) {
+  if (!env.AUTH_KV) return null;
   try {
-    const raw = await env.AUTH_KV.get('admin_password');
-    return raw || DEFAULT_ADMIN_PASSWORD;
+    return await env.AUTH_KV.get('site_admin_pwd');
   } catch {
-    return DEFAULT_ADMIN_PASSWORD;
+    return null;
   }
 }
 
 /**
- * 设置管理密码（存储到 KV）
+ * 设置站点管理员密码（存储到 KV）
  */
-async function setAdminPassword(env, password) {
-  if (!env.AUTH_KV) {
-    throw new Error('KV 存储未配置');
-  }
-  await env.AUTH_KV.put('admin_password', password);
+async function setSiteAdminPassword(env, password) {
+  if (!env.AUTH_KV) throw new Error('KV 存储未配置');
+  await env.AUTH_KV.put('site_admin_pwd', password);
 }
 
 /**
- * 验证管理密码
+ * 检查站点管理员密码是否已初始化
+ */
+async function handleAdminCheckInit(context) {
+  const { env } = context;
+
+  try {
+    const pwd = await getSiteAdminPassword(env);
+    return new Response(JSON.stringify({ success: true, initialized: !!pwd }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ success: false, error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+}
+
+/**
+ * 初始化站点管理员密码（仅首次设置）
+ */
+async function handleAdminInit(context) {
+  const { request, env } = context;
+
+  if (!env.AUTH_KV) {
+    return new Response(JSON.stringify({ success: false, error: 'KV 存储未配置' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+
+  try {
+    const body = await request.json();
+    const { password } = body;
+
+    if (!password || password.length < 6) {
+      return new Response(JSON.stringify({ success: false, error: '密码长度至少 6 位' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    // 检查是否已初始化
+    const existing = await getSiteAdminPassword(env);
+    if (existing) {
+      return new Response(JSON.stringify({ success: false, error: '管理员密码已设置，无需重复初始化' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    await setSiteAdminPassword(env, password);
+    return new Response(JSON.stringify({ success: true, msg: '管理员密码设置成功' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ success: false, error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+}
+
+/**
+ * 验证站点管理员密码（登录）
  */
 async function handleAdminVerify(context) {
   const { request, env } = context;
@@ -348,9 +430,15 @@ async function handleAdminVerify(context) {
       });
     }
 
-    const storedPassword = await getAdminPassword(env);
-    const isValid = password === storedPassword;
+    const storedPassword = await getSiteAdminPassword(env);
+    if (!storedPassword) {
+      return new Response(JSON.stringify({ success: false, error: '管理员密码未设置，请先初始化' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
 
+    const isValid = password === storedPassword;
     return new Response(JSON.stringify({ success: isValid, error: isValid ? null : '管理密码错误' }), {
       status: 200,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
@@ -364,7 +452,7 @@ async function handleAdminVerify(context) {
 }
 
 /**
- * 修改管理密码
+ * 修改站点管理员密码
  */
 async function handleAdminChange(context) {
   const { request, env } = context;
@@ -394,7 +482,14 @@ async function handleAdminChange(context) {
       });
     }
 
-    const storedPassword = await getAdminPassword(env);
+    const storedPassword = await getSiteAdminPassword(env);
+    if (!storedPassword) {
+      return new Response(JSON.stringify({ success: false, error: '管理员密码未设置' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
     if (oldPassword !== storedPassword) {
       return new Response(JSON.stringify({ success: false, error: '原密码错误' }), {
         status: 400,
@@ -402,9 +497,8 @@ async function handleAdminChange(context) {
       });
     }
 
-    await setAdminPassword(env, newPassword);
-
-    return new Response(JSON.stringify({ success: true, msg: '管理密码修改成功' }), {
+    await setSiteAdminPassword(env, newPassword);
+    return new Response(JSON.stringify({ success: true, msg: '密码修改成功，请使用新密码重新登录' }), {
       status: 200,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     });
@@ -420,7 +514,7 @@ async function handleAdminChange(context) {
  * 检查是否已验证管理密码（通过 Cookie 或 Session）
  */
 async function handleAdminCheck(context) {
-  const { request, env } = context;
+  const { request } = context;
 
   // 从 Cookie 中读取 admin_verified 标记
   const cookieHeader = request.headers.get('Cookie') || '';
@@ -430,6 +524,237 @@ async function handleAdminCheck(context) {
     status: 200,
     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
   });
+}
+
+// ==================== 服务商管理（KV Key: provider_data_list / active_provider_id） ====================
+
+/**
+ * 获取全部服务商数据
+ */
+async function getProviders(env) {
+  if (!env.AUTH_KV) return [];
+  try {
+    const raw = await env.AUTH_KV.get('provider_data_list');
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 保存全部服务商数据
+ */
+async function saveProviders(env, providers) {
+  if (!env.AUTH_KV) throw new Error('KV 存储未配置');
+  await env.AUTH_KV.put('provider_data_list', JSON.stringify(providers));
+}
+
+/**
+ * 获取活跃服务商 ID
+ */
+async function getActiveProviderId(env) {
+  if (!env.AUTH_KV) return null;
+  try {
+    return await env.AUTH_KV.get('active_provider_id');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 设置活跃服务商 ID
+ */
+async function setActiveProviderId(env, providerId) {
+  if (!env.AUTH_KV) throw new Error('KV 存储未配置');
+  await env.AUTH_KV.put('active_provider_id', providerId);
+}
+
+/**
+ * 获取服务商列表
+ */
+async function handleProviderList(context) {
+  const { env } = context;
+
+  try {
+    const providers = await getProviders(env);
+    const activeId = await getActiveProviderId(env);
+    return new Response(JSON.stringify({ success: true, data: providers, activeId }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ success: false, error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+}
+
+/**
+ * 保存服务商（新增或编辑）
+ */
+async function handleProviderSave(context) {
+  const { request, env } = context;
+
+  if (!env.AUTH_KV) {
+    return new Response(JSON.stringify({ success: false, error: 'KV 存储未配置' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+
+  try {
+    const body = await request.json();
+    const { id, name, url, account, apiKey, notes, createdAt } = body;
+
+    if (!id || !name || !url) {
+      return new Response(JSON.stringify({ success: false, error: '缺少必填字段 (id/name/url)' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    const providers = await getProviders(env);
+    const existingIndex = providers.findIndex(p => p.id === id);
+
+    const providerData = {
+      id,
+      name,
+      url,
+      account: account || '',
+      apiKey: apiKey || '',
+      notes: notes || '',
+      createdAt: createdAt || Math.floor(Date.now() / 1000),
+      updatedAt: Math.floor(Date.now() / 1000)
+    };
+
+    if (existingIndex >= 0) {
+      // 编辑模式：保留原有 createdAt
+      providerData.createdAt = providers[existingIndex].createdAt;
+      providers[existingIndex] = providerData;
+    } else {
+      // 新增模式
+      providers.push(providerData);
+      // 如果是第一个服务商，自动设为活跃
+      if (providers.length === 1) {
+        await setActiveProviderId(env, id);
+      }
+    }
+
+    await saveProviders(env, providers);
+    const activeId = await getActiveProviderId(env);
+
+    return new Response(JSON.stringify({ success: true, data: providers, activeId, msg: existingIndex >= 0 ? '服务商已更新' : '服务商已添加' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ success: false, error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+}
+
+/**
+ * 删除服务商
+ */
+async function handleProviderDelete(context) {
+  const { request, env } = context;
+
+  if (!env.AUTH_KV) {
+    return new Response(JSON.stringify({ success: false, error: 'KV 存储未配置' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+
+  try {
+    const body = await request.json();
+    const { id } = body;
+
+    if (!id) {
+      return new Response(JSON.stringify({ success: false, error: '缺少服务商 ID' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    let providers = await getProviders(env);
+    providers = providers.filter(p => p.id !== id);
+
+    // 如果删除的是活跃服务商，清除活跃标记
+    const activeId = await getActiveProviderId(env);
+    let newActiveId = activeId;
+    if (activeId === id) {
+      newActiveId = providers.length > 0 ? providers[0].id : null;
+      if (newActiveId) {
+        await setActiveProviderId(env, newActiveId);
+      } else {
+        await env.AUTH_KV.delete('active_provider_id');
+      }
+    }
+
+    await saveProviders(env, providers);
+
+    return new Response(JSON.stringify({ success: true, data: providers, activeId: newActiveId, msg: '服务商已删除' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ success: false, error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+}
+
+/**
+ * 设置活跃服务商
+ */
+async function handleProviderActive(context) {
+  const { request, env } = context;
+
+  if (!env.AUTH_KV) {
+    return new Response(JSON.stringify({ success: false, error: 'KV 存储未配置' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+
+  try {
+    const body = await request.json();
+    const { id } = body;
+
+    if (!id) {
+      return new Response(JSON.stringify({ success: false, error: '缺少服务商 ID' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    // 验证服务商存在
+    const providers = await getProviders(env);
+    const provider = providers.find(p => p.id === id);
+    if (!provider) {
+      return new Response(JSON.stringify({ success: false, error: '服务商不存在' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    await setActiveProviderId(env, id);
+
+    return new Response(JSON.stringify({ success: true, data: providers, activeId: id, msg: '已切换活跃服务商' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ success: false, error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
 }
 
 // ==================== OPTIONS 预检请求 ====================
