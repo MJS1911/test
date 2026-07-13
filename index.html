@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>魔方财务自动化开机管理平台</title>
-    <link rel="stylesheet" href="css/style.css?v=20260714g">
+    <link rel="stylesheet" href="css/style.css?v=20260714i">
     <script>
     (function () {
         try {
@@ -104,7 +104,7 @@
                         <button type="button" class="btn btn-outline btn-sm" id="btnScheduleRunNow" onclick="runScheduledCheck()" title="立即执行一轮（全量）">立即巡检</button>
                     </div>
                     <div class="schedule-status" id="scheduleStatus">加载中…</div>
-                    <p class="schedule-ops-hint" style="font-size:0.75rem;color:var(--text-muted);margin-top:8px;line-height:1.4;"><strong>关页后必配：</strong>用 <a href="https://cron-job.org" target="_blank" rel="noopener">cron-job.org</a> 每 1 分钟访问你的站点 <code>/api/schedule/run</code>（未到间隔会跳过；多机会自动分片续跑直到全部完成）。打开本页时也会辅助触发。</p>
+                    <p class="schedule-ops-hint" style="font-size:0.75rem;color:var(--text-muted);margin-top:8px;line-height:1.4;"><strong>关页后必配：</strong>用 <a href="https://cron-job.org" target="_blank" rel="noopener">cron-job.org</a> 每 1 分钟访问你的站点 <code>/api/schedule/run</code>（GET/POST 均可）。未到间隔会跳过；多机自动分片续跑，每台查状态后 hard_reboot→reboot，直到全部完成。打开本页时也会辅助触发。</p>
                 </div>
                 <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
                     <button class="btn btn-outline btn-sm btn-block" onclick="openChangePasswordDialog()">🔑 修改管理密码</button>
@@ -272,10 +272,10 @@
         <div class="log-content" id="logContent"></div>
     </div>
 
-    <script src="js/api.js?v=20260714g"></script>
-    <script src="js/adminAuth.js?v=20260714g"></script>
-    <script src="js/ui.js?v=20260714g"></script>
-    <script src="js/operations.js?v=20260714g"></script>
+    <script src="js/api.js?v=20260714i"></script>
+    <script src="js/adminAuth.js?v=20260714i"></script>
+    <script src="js/ui.js?v=20260714i"></script>
+    <script src="js/operations.js?v=20260714i"></script>
     <script>
     // ==================== 服务商标签栏管理 ====================
 

@@ -351,23 +351,37 @@ async function fetchScheduleStatus() {
     return null;
 }
 
-/** 分片巡检进行中时，前端辅助触发 continue + 刷新状态 */
+/** 分片巡检进行中时，前端辅助触发 continue + 刷新状态（更积极，保证多机全量） */
 function startForceWatchPolling() {
     if (scheduleForceWatchTimer) return;
     let ticks = 0;
-    scheduleForceWatchTimer = setInterval(function () {
+    let lastContinueCursor = null;
+    function tickContinue() {
         ticks++;
-        fetch('/api/schedule/run?continue=1', { method: 'POST' })
+        const body = {};
+        // 优先用上次响应的 continueCursor（含 hostIds 快照），否则用 status 里的 cursor
+        const snap = lastContinueCursor ||
+            (scheduleConfig && scheduleConfig.cursor
+                ? Object.assign({}, scheduleConfig.cursor, scheduleConfig.stats ? { stats: scheduleConfig.stats } : {})
+                : null);
+        if (snap) body.cursor = snap;
+        fetch('/api/schedule/run?continue=1', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Schedule-Continue': '1' },
+            body: JSON.stringify(body)
+        })
             .then(function (r) { return r.json(); })
             .then(function (result) {
+                if (result && result.continueCursor) lastContinueCursor = result.continueCursor;
                 if (result && result.config) {
                     scheduleConfig = result.config;
                     updateScheduleUI();
                 }
-                if (!result || result.needContinue || (result.config && result.config.running)) {
-                    // 仍在跑
+                if (!result || result.needContinue || (result.config && result.config.running && result.config.cursor)) {
+                    // 仍在跑：若被锁跳过也继续盯
                 } else {
                     stopForceWatchPolling();
+                    lastContinueCursor = null;
                     if (result && result.summary) {
                         showToast(result.summary, 'success');
                         log('info', '服务端巡检完成', result.summary);
@@ -376,9 +390,12 @@ function startForceWatchPolling() {
                 }
             })
             .catch(function () { fetchScheduleStatus(); });
-        // 最长盯 8 分钟
-        if (ticks >= 96) stopForceWatchPolling();
-    }, 5000);
+        // 最长盯 15 分钟
+        if (ticks >= 450) stopForceWatchPolling();
+    }
+    // 立即触发一次，再每 2 秒续跑（多机时尽快跑完）
+    tickContinue();
+    scheduleForceWatchTimer = setInterval(tickContinue, 2000);
 }
 
 function stopForceWatchPolling() {
@@ -390,10 +407,10 @@ function stopForceWatchPolling() {
 
 function startScheduleStatusPolling() {
     if (scheduleStatusPollTimer) return;
-    // 每 45 秒：刷新状态 + 触发 run（未到间隔跳过；有 cursor 则续跑）
+    // 每 30 秒：刷新状态 + 触发 run（未到间隔跳过；有 cursor 则续跑）
     // 打开本页时可作为辅助 cron；关页后必须配置外部 cron
     scheduleStatusPollTimer = setInterval(function () {
-        fetch('/api/schedule/run', { method: 'POST' })
+        fetch('/api/schedule/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
             .then(function (r) { return r.json(); })
             .then(function (result) {
                 if (result && result.config) {
@@ -407,7 +424,7 @@ function startScheduleStatusPolling() {
                 }
             })
             .catch(function () { fetchScheduleStatus(); });
-    }, 45000);
+    }, 30000);
 }
 
 function stopScheduleStatusPolling() {
@@ -510,11 +527,19 @@ async function runScheduledCheck() {
     updateScheduleUI();
     showToast('正在触发服务端巡检（全部机器）…', 'info');
     try {
-        const resp = await fetch('/api/schedule/run?force=1', { method: 'POST' });
+        // force=1：有未完成进度则续跑，无进度则开新一轮（服务端逻辑）
+        const resp = await fetch('/api/schedule/run?force=1', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
         const result = await resp.json();
         if (result && result.config) scheduleConfig = result.config;
         updateScheduleUI();
-        if (result && result.skipped) {
+        if (result && result.skipped && result.reason === 'already_running') {
+            showToast('巡检进行中，继续处理剩余机器…', 'info');
+            startForceWatchPolling();
+        } else if (result && result.skipped) {
             showToast('已跳过: ' + (result.reason || ''), 'info');
         } else if (result && result.needContinue) {
             showToast((result.summary || '巡检进行中') + '，后台继续处理剩余机器…', 'info');
@@ -527,7 +552,7 @@ async function runScheduledCheck() {
             showToast((result && result.error) || '巡检失败', 'error');
         }
         await fetchScheduleStatus();
-        if (scheduleConfig && scheduleConfig.running) startForceWatchPolling();
+        if (scheduleConfig && (scheduleConfig.running || scheduleConfig.cursor)) startForceWatchPolling();
     } catch (e) {
         showToast('触发失败: ' + e.message, 'error');
     } finally {

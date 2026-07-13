@@ -934,12 +934,16 @@ const SCHEDULE_MAX_LOGS = 150;
 const SCHEDULE_DEFAULT_INTERVAL = 5;
 const SCHEDULE_MIN_INTERVAL = 1;
 const SCHEDULE_MAX_INTERVAL = 1440;
-/** 单次调用时间预算(ms)，留余量给收尾与自续跑，避免 CF 硬超时只处理 1 台 */
-const SCHEDULE_TIME_BUDGET_MS = 22000;
+/** 单次调用时间预算(ms)：留足写 KV 余量，避免硬超时丢进度；到期后 yielded 让出 */
+const SCHEDULE_TIME_BUDGET_MS = 14000;
 /** 卡住 running 超过此时长则强制解锁续跑 */
 const SCHEDULE_STALE_MS = 90 * 1000;
 /** 主机间最小间隔，避免打爆目标站 */
-const SCHEDULE_HOST_GAP_MS = 80;
+const SCHEDULE_HOST_GAP_MS = 30;
+/** 并发锁：running 且未 yielded 时，心跳在此时间内视为「有人在跑」 */
+const SCHEDULE_LOCK_MS = 20000;
+/** waitUntil 后台最多续跑跳数（每跳可再处理若干台） */
+const SCHEDULE_CONTINUE_MAX_HOPS = 20;
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -959,8 +963,16 @@ function defaultScheduleConfig() {
     stats: null,
     cursor: null,
     progress: null,
+    roundId: null,
+    claimToken: null,
+    /** true=本分片已让出，允许 continue/cron 立刻接棒（解决 waitUntil 被锁挡住只跑 1 台） */
+    yielded: false,
     updatedAt: null
   };
+}
+
+function newRoundId() {
+  return Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
 }
 
 function defaultRoundStats() {
@@ -1240,104 +1252,171 @@ function sanitizeCursorForKv(cursor) {
     providerId: cursor.providerId || null,
     jwt: null,
     baseUrl: null,
-    pname: cursor.pname || null
+    pname: cursor.pname || null,
+    roundId: cursor.roundId || null
   };
 }
 
 /**
+ * 判断是否有未完成的分片进度（必须续跑，不能开新一轮）
+ */
+function hasIncompleteCursor(cfg) {
+  if (!cfg) return false;
+  // 已开跑 / 主动让出等待续跑
+  if (cfg.running && cfg.roundId) return true;
+  if (cfg.yielded && (cfg.cursor || cfg.roundId)) return true;
+  if (!cfg.cursor) return false;
+  const c = cfg.cursor;
+  if (Array.isArray(c.hostIds) && c.hostIds.length > 0 && (c.hostIdx || 0) < c.hostIds.length) return true;
+  if ((c.providerIdx || 0) > 0) return true;
+  if ((c.hostIdx || 0) > 0) return true;
+  // 有 hostIds 列表但还没扫完（含 hostIdx=0 刚拉完列表）
+  if (Array.isArray(c.hostIds) && c.hostIds.length > 0) return true;
+  // running + cursor 存在（登录中）
+  if (cfg.running && cfg.cursor) return true;
+  // 有 roundId + cursor 说明本轮未 finish
+  if (cfg.roundId && cfg.cursor) return true;
+  return false;
+}
+
+/**
  * 执行/续跑一轮巡检。
- * options: { force, isContinue }
+ * options: { force, isContinue, bodyCursor, hop }
  * 返回 needContinue=true 时调用方应 waitUntil 自调用 continue
  *
- * 关键：外部 cron 只打 /api/schedule/run（无 continue=1）时，
- * 若 KV 里仍有未完成 cursor，必须自动续跑，绝不能重置到第 0 台，
- * 否则关页后每分钟只会重复处理前几台。
+ * 关键修复（关 3 台只成功 1 台）：
+ * 1. 时间预算 14s，每机处理完立刻写 KV，硬超时不丢进度
+ * 2. waitUntil 多跳续跑 + body.cursor 快照，不依赖 KV 最终一致
+ * 3. 外部 cron 无 continue 时自动 resume，绝不重置到第 0 台
+ * 4. 认领锁：进入执行前写 claimToken，避免双开漏机/空转
+ * 5. force 且有未完成进度时默认续跑（除非 forceNew）
  */
 async function executeScheduleRound(env, options = {}) {
   const force = !!options.force;
+  const forceNew = !!options.forceNew;
   const isContinue = !!options.isContinue;
+  const bodyCursor = options.bodyCursor || null;
+  const hop = Math.max(0, parseInt(options.hop, 10) || 0);
   let cfg = await getScheduleConfig(env);
 
-  // 有未完成分片进度：非 force 一律续跑（cron 无 continue 参数也能接上）
-  const hasIncomplete = !!(cfg.cursor && (
-    cfg.running ||
-    (Array.isArray(cfg.cursor.hostIds) && cfg.cursor.hostIds.length > 0) ||
-    (cfg.cursor.providerIdx > 0) ||
-    (cfg.cursor.hostIdx > 0)
-  ));
-  const resume = !force && hasIncomplete;
+  // body 带来的 cursor：必须 roundId 一致，防止旧 waitUntil 覆盖新一轮
+  if (isContinue && bodyCursor && typeof bodyCursor === 'object') {
+    const bodyRound = bodyCursor.roundId || null;
+    const cfgRound = cfg.roundId || (cfg.cursor && cfg.cursor.roundId) || null;
+    const roundMismatch = !!(cfgRound && bodyRound && bodyRound !== cfgRound);
+    if (!roundMismatch) {
+      const bodyHasHosts = Array.isArray(bodyCursor.hostIds) && bodyCursor.hostIds.length > 0;
+      const bodyAhead = bodyHasHosts && (
+        !cfg.cursor ||
+        !hasIncompleteCursor(cfg) ||
+        (bodyCursor.providerIdx || 0) > (cfg.cursor.providerIdx || 0) ||
+        ((bodyCursor.providerIdx || 0) === (cfg.cursor.providerIdx || 0) &&
+          (bodyCursor.hostIdx || 0) >= (cfg.cursor.hostIdx || 0))
+      );
+      if (bodyAhead || (bodyHasHosts && !cfg.cursor)) {
+        cfg.cursor = sanitizeCursorForKv(bodyCursor);
+        if (bodyCursor.stats) cfg.stats = Object.assign(defaultRoundStats(), bodyCursor.stats);
+        if (bodyRound) cfg.roundId = bodyRound;
+        cfg.running = true;
+      }
+    }
+  }
+
+  const hasIncomplete = hasIncompleteCursor(cfg);
+  // 有未完成进度：一律续跑（含 force=1 立即巡检），除非 forceNew 强制开新一轮
+  // 无进度：force 或到期 → 开新一轮
+  const resume = hasIncomplete && !forceNew;
 
   if (!cfg.enabled && !force && !resume) {
     return { skipped: true, reason: 'disabled', config: cfg };
   }
 
-  // 显式 continue 但无进度
+  // continue 请求绝不开新一轮：无进度则直接结束
   if (isContinue && !hasIncomplete) {
-    return { skipped: true, reason: 'no_cursor', config: cfg };
+    return { skipped: true, reason: 'no_cursor', config: cfg, needContinue: false };
   }
 
-  if (resume) {
-    // 另一分片刚写入（15s 内）则避免双开；过期则接管续跑
-    if (cfg.running && cfg.updatedAt && !isContinue) {
-      const updated = new Date(cfg.updatedAt).getTime();
-      if (!isNaN(updated) && Date.now() - updated < 15000) {
-        return {
-          skipped: true,
-          reason: 'already_running',
-          needContinue: true,
-          config: cfg,
-          summary: formatScheduleSummary(cfg.stats) + (cfg.progress ? ' · ' + cfg.progress : '')
-        };
-      }
+  // 并发锁：running 且心跳新鲜 → 跳过；但 yielded=true 表示上一分片已主动让出，continue/cron 可立刻接棒
+  if (cfg.running && cfg.updatedAt && !cfg.yielded) {
+    const updated = new Date(cfg.updatedAt).getTime();
+    const age = isNaN(updated) ? Infinity : (Date.now() - updated);
+    if (age < SCHEDULE_LOCK_MS) {
+      return {
+        skipped: true,
+        reason: 'already_running',
+        needContinue: !!(cfg.cursor || hasIncomplete),
+        config: cfg,
+        summary: formatScheduleSummary(cfg.stats) + (cfg.progress ? ' · ' + cfg.progress : ''),
+        continueCursor: cfg.cursor
+          ? Object.assign(sanitizeCursorForKv(cfg.cursor) || {}, { stats: Object.assign({}, cfg.stats || {}) })
+          : null
+      };
     }
-  } else {
-    // 新一轮：未到点则跳过（force 除外）
+    // 非 resume 新一轮：stale 内也跳过
+    if (!resume && !force && age < SCHEDULE_STALE_MS) {
+      return {
+        skipped: true,
+        reason: 'already_running',
+        needContinue: !!cfg.cursor,
+        config: cfg,
+        continueCursor: cfg.cursor
+          ? Object.assign(sanitizeCursorForKv(cfg.cursor) || {}, { stats: Object.assign({}, cfg.stats || {}) })
+          : null
+      };
+    }
+  }
+
+  if (!resume) {
     if (!force && cfg.nextRunAt) {
       const next = new Date(cfg.nextRunAt).getTime();
       if (!isNaN(next) && Date.now() < next - 2000) {
         return { skipped: true, reason: 'not_due', config: cfg, nextRunAt: cfg.nextRunAt };
       }
     }
-    // 防并发：非 force 且 running 未过期 → 跳过；force 或过期则强制开新一轮
-    if (!force && cfg.running && cfg.updatedAt) {
-      const updated = new Date(cfg.updatedAt).getTime();
-      if (!isNaN(updated) && Date.now() - updated < SCHEDULE_STALE_MS) {
-        return { skipped: true, reason: 'already_running', config: cfg };
-      }
-    }
-    // 开新一轮前清掉旧进度
     cfg.running = false;
     cfg.cursor = null;
     cfg.progress = null;
+    cfg.roundId = newRoundId();
+    cfg.claimToken = null;
+    cfg.yielded = false;
   }
 
   const logBuf = createLogBuffer();
   const startedAt = Date.now();
   const providers = await getProviders(env);
+  const roundId = cfg.roundId || newRoundId();
+  // 接棒时换新 claimToken；yielded 或锁过期时允许新 worker 接管
+  const claimToken = newRoundId();
+  cfg.roundId = roundId;
+  cfg.claimToken = claimToken;
+  cfg.yielded = false; // 本 worker 已认领，清除让出标记
 
   let stats;
   let cursor;
   if (resume) {
     stats = Object.assign(defaultRoundStats(), cfg.stats || {});
     cursor = Object.assign({
-      providerIdx: 0, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null, pname: null
+      providerIdx: 0, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null, pname: null, roundId
     }, cfg.cursor || {});
-    // 心跳：标记本分片已接管，供并发跳过
+    cursor.roundId = roundId;
     cfg.running = true;
     cfg.stats = stats;
     cfg.cursor = sanitizeCursorForKv(cursor);
+    cfg.progress = cfg.progress || ('续跑 p=' + (cursor.providerIdx || 0) + ' h=' + (cursor.hostIdx || 0));
     await saveScheduleConfig(env, cfg);
     logBuf.push('info', '续跑巡检', 'p=' + (cursor.providerIdx || 0) + ' h=' + (cursor.hostIdx || 0) +
-      (cursor.hostIds ? '/' + cursor.hostIds.length : '') + (isContinue ? ' (continue)' : ' (cron/auto)'));
+      (cursor.hostIds ? '/' + cursor.hostIds.length : '') +
+      (isContinue ? ' (continue hop=' + hop + ')' : ' (cron/auto)'));
   } else {
     stats = defaultRoundStats();
-    cursor = { providerIdx: 0, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null, pname: null };
+    cursor = { providerIdx: 0, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null, pname: null, roundId };
     cfg.running = true;
     cfg.cursor = sanitizeCursorForKv(cursor);
     cfg.stats = stats;
     cfg.progress = '0%';
     await saveScheduleConfig(env, cfg);
-    logBuf.push('info', '开始巡检', 'interval=' + (cfg.intervalMin || SCHEDULE_DEFAULT_INTERVAL) + 'min force=' + force);
+    logBuf.push('info', '开始巡检', 'interval=' + (cfg.intervalMin || SCHEDULE_DEFAULT_INTERVAL) +
+      'min force=' + force + ' round=' + roundId + ' providers=' + (providers ? providers.length : 0));
   }
 
   if (!providers || providers.length === 0) {
@@ -1346,40 +1425,109 @@ async function executeScheduleRound(env, options = {}) {
     return await finishScheduleRound(env, cfg, stats, logBuf, true);
   }
 
+  /** 写回分片进度；返回最终 hostIdx（禁止回退，供外层循环同步）。若 claim 被抢占返回 -1 */
+  async function persistPartial(pIdx, hIdx, pname, hostIdsLen) {
+    try {
+      const latest = await getScheduleConfig(env);
+      // 其他 worker 已抢占本轮 → 本 worker 退出，避免双开漏机/重复
+      if (latest && latest.roundId && latest.roundId !== roundId) {
+        return -1;
+      }
+      if (latest && latest.claimToken && latest.claimToken !== claimToken &&
+          latest.running && latest.updatedAt) {
+        const u = new Date(latest.updatedAt).getTime();
+        if (!isNaN(u) && Date.now() - u < SCHEDULE_LOCK_MS) {
+          return -1;
+        }
+      }
+      if (latest && latest.cursor && latest.cursor.hostIds && cursor.hostIds &&
+          latest.cursor.providerId === cursor.providerId &&
+          (latest.cursor.providerIdx || 0) === pIdx) {
+        const latestH = latest.cursor.hostIdx || 0;
+        if (latestH > hIdx) {
+          hIdx = latestH;
+          if (latest.stats) {
+            stats.checked = Math.max(stats.checked, latest.stats.checked || 0);
+            stats.running = Math.max(stats.running, latest.stats.running || 0);
+            stats.recovered = Math.max(stats.recovered, latest.stats.recovered || 0);
+            stats.failed = Math.max(stats.failed, latest.stats.failed || 0);
+          }
+        }
+      }
+    } catch (_) { /* ignore */ }
+    cursor.providerIdx = pIdx;
+    cursor.hostIdx = hIdx;
+    cursor.roundId = roundId;
+    cfg.cursor = sanitizeCursorForKv(cursor);
+    cfg.stats = stats;
+    cfg.running = true;
+    cfg.roundId = roundId;
+    cfg.claimToken = claimToken;
+    cfg.progress = '[' + (cursor.pname || pname || '?') + '] ' + hIdx + '/' + (hostIdsLen || (cursor.hostIds || []).length);
+    await saveScheduleConfig(env, cfg);
+    return hIdx;
+  }
+
+  async function yieldAndPartial() {
+    // 主动让出：running=false + yielded=true，waitUntil/前端/cron 可立刻接棒（不被锁挡住）
+    // cursor/stats/roundId 保留，hasIncompleteCursor 仍为 true
+    cfg.yielded = true;
+    cfg.running = false;
+    cfg.cursor = sanitizeCursorForKv(cursor);
+    cfg.stats = stats;
+    cfg.roundId = roundId;
+    cfg.claimToken = claimToken;
+    cfg.progress = (cfg.progress || '') + ' · 等待续跑';
+    try {
+      await saveScheduleConfig(env, cfg);
+    } catch (_) { /* ignore */ }
+    return {
+      skipped: false,
+      success: true,
+      partial: true,
+      needContinue: true,
+      hop,
+      summary: formatScheduleSummary(stats) + ' · 续跑 ' + (cfg.progress || ''),
+      stats,
+      config: cfg,
+      continueCursor: Object.assign(sanitizeCursorForKv(cursor) || {}, {
+        stats: Object.assign({}, stats),
+        roundId
+      })
+    };
+  }
+
   try {
     let pIdx = cursor.providerIdx || 0;
 
     while (pIdx < providers.length) {
       if (Date.now() - startedAt > SCHEDULE_TIME_BUDGET_MS) {
-        cursor.providerIdx = pIdx;
-        // 不把 jwt 写入 KV（安全 + 体积）；续跑时重新登录
-        cfg.cursor = sanitizeCursorForKv(cursor);
-        cfg.stats = stats;
-        cfg.running = true;
-        cfg.progress = '服务商 ' + (pIdx + 1) + '/' + providers.length;
-        await saveScheduleConfig(env, cfg);
+        const saved = await persistPartial(pIdx, cursor.hostIdx || 0, cursor.pname, (cursor.hostIds || []).length);
+        if (saved < 0) {
+          await logBuf.flush(env);
+          return {
+            skipped: true,
+            reason: 'claim_lost',
+            needContinue: true,
+            config: cfg,
+            continueCursor: Object.assign(sanitizeCursorForKv(cursor) || {}, { stats: Object.assign({}, stats) })
+          };
+        }
         await logBuf.flush(env);
-        return {
-          skipped: false,
-          success: true,
-          partial: true,
-          needContinue: true,
-          summary: formatScheduleSummary(stats) + '（分片续跑中…）',
-          stats,
-          config: cfg
-        };
+        return await yieldAndPartial();
       }
 
       const provider = providers[pIdx];
-      const pname = provider.name || provider.id || 'unknown';
+      const pname = provider.name || provider.id || ('p' + pIdx);
+      const providerKey = provider.id != null ? provider.id : ('idx_' + pIdx);
 
-      // 需要登录 + 拉列表（新服务商或 hostIds 未缓存）；续跑时重新登录拿新 JWT
-      if (!cursor.hostIds || cursor.providerId !== provider.id || !cursor.jwt || !cursor.baseUrl) {
+      // 需要登录 + 拉列表；续跑时重新登录拿新 JWT
+      if (!cursor.hostIds || cursor.providerId !== providerKey || !cursor.jwt || !cursor.baseUrl) {
         if (!provider.account || !provider.apiKey) {
           logBuf.push('warning', '[' + pname + '] 缺少凭证，跳过');
           stats.failed++;
           pIdx++;
-          cursor = { providerIdx: pIdx, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null };
+          cursor = { providerIdx: pIdx, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null, pname: null, roundId };
           continue;
         }
 
@@ -1388,23 +1536,22 @@ async function executeScheduleRound(env, options = {}) {
           logBuf.push('error', '[' + pname + '] 登录失败', login.error);
           stats.failed++;
           pIdx++;
-          cursor = { providerIdx: pIdx, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null };
+          cursor = { providerIdx: pIdx, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null, pname: null, roundId };
           continue;
         }
 
         let hostIds = cursor.hostIds;
         let hostIdx = cursor.hostIdx || 0;
-        // 同一服务商续跑：保留 hostIds/hostIdx，只刷新 jwt
-        if (!hostIds || cursor.providerId !== provider.id) {
+        if (!hostIds || cursor.providerId !== providerKey) {
           const hostsRes = await serverFetchAllHosts(login.baseUrl, login.jwt);
           if (!hostsRes.ok) {
             logBuf.push('error', '[' + pname + '] 获取列表失败', hostsRes.error);
             stats.failed++;
             pIdx++;
-            cursor = { providerIdx: pIdx, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null };
+            cursor = { providerIdx: pIdx, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null, pname: null, roundId };
             continue;
           }
-          hostIds = hostsRes.hosts.map(h => h.id).filter(Boolean);
+          hostIds = hostsRes.hosts.map(h => h.id).filter(id => id != null && id !== '');
           hostIdx = 0;
           logBuf.push('info', '[' + pname + '] 开始检查', '共 ' + hostIds.length + ' 台');
         } else {
@@ -1415,39 +1562,49 @@ async function executeScheduleRound(env, options = {}) {
           providerIdx: pIdx,
           hostIdx,
           hostIds,
-          providerId: provider.id,
+          providerId: providerKey,
           jwt: login.jwt,
           baseUrl: login.baseUrl,
-          pname
+          pname,
+          roundId
         };
+        // 登录+拉列表后立刻落盘，防止后续硬超时丢 hostIds
+        hostIdx = await persistPartial(pIdx, hostIdx, pname, hostIds.length);
+        if (hostIdx < 0) {
+          await logBuf.flush(env);
+          return {
+            skipped: true,
+            reason: 'claim_lost',
+            needContinue: true,
+            config: cfg,
+            continueCursor: Object.assign(sanitizeCursorForKv(cursor) || {}, { stats: Object.assign({}, stats) })
+          };
+        }
+        cursor.hostIdx = hostIdx;
       }
 
       const hostIds = cursor.hostIds || [];
       let hIdx = cursor.hostIdx || 0;
 
       while (hIdx < hostIds.length) {
+        // 预算检查放在处理前：保证当前机处理完才超时退出
         if (Date.now() - startedAt > SCHEDULE_TIME_BUDGET_MS) {
-          cursor.hostIdx = hIdx;
-          cursor.providerIdx = pIdx;
-          cfg.cursor = sanitizeCursorForKv(cursor);
-          cfg.stats = stats;
-          cfg.running = true;
-          cfg.progress = '[' + (cursor.pname || pname) + '] ' + hIdx + '/' + hostIds.length;
-          await saveScheduleConfig(env, cfg);
+          const saved = await persistPartial(pIdx, hIdx, pname, hostIds.length);
+          if (saved < 0) {
+            await logBuf.flush(env);
+            return {
+              skipped: true,
+              reason: 'claim_lost',
+              needContinue: true,
+              config: cfg,
+              continueCursor: Object.assign(sanitizeCursorForKv(cursor) || {}, { stats: Object.assign({}, stats) })
+            };
+          }
           await logBuf.flush(env);
-          return {
-            skipped: false,
-            success: true,
-            partial: true,
-            needContinue: true,
-            summary: formatScheduleSummary(stats) + ' · 续跑 ' + cfg.progress,
-            stats,
-            config: cfg
-          };
+          return await yieldAndPartial();
         }
 
         const hostId = hostIds[hIdx];
-        hIdx++;
         try {
           const stParams = new URLSearchParams();
           stParams.append('id', String(hostId));
@@ -1480,12 +1637,43 @@ async function executeScheduleRound(env, options = {}) {
           logBuf.push('error', '[' + pname + '] #' + hostId + ' 异常', hostErr.message);
         }
 
+        // 本机处理完再推进下标，并立刻写 KV（核心：硬超时也不丢已完成进度）
+        hIdx++;
+        cursor.hostIdx = hIdx;
+        cursor.providerIdx = pIdx;
+        try {
+          const saved = await persistPartial(pIdx, hIdx, pname, hostIds.length);
+          if (saved < 0) {
+            await logBuf.flush(env);
+            return { skipped: true, reason: 'claim_lost', needContinue: true, config: cfg };
+          }
+          hIdx = saved;
+          cursor.hostIdx = hIdx;
+        } catch (kvErr) {
+          console.warn('persistPartial failed:', kvErr);
+        }
+
+        // 日志缓冲较大时中途 flush，避免丢日志
+        if (stats.checked % 3 === 0) {
+          await logBuf.flush(env);
+        }
+
         await sleepMs(SCHEDULE_HOST_GAP_MS);
       }
 
       // 当前服务商完成
       pIdx++;
-      cursor = { providerIdx: pIdx, hostIdx: 0, hostIds: null, providerId: null, jwt: null, baseUrl: null };
+      cursor = {
+        providerIdx: pIdx, hostIdx: 0, hostIds: null, providerId: null,
+        jwt: null, baseUrl: null, pname: null, roundId
+      };
+      cfg.cursor = sanitizeCursorForKv(cursor);
+      cfg.stats = stats;
+      cfg.running = true;
+      cfg.claimToken = claimToken;
+      cfg.roundId = roundId;
+      cfg.progress = '服务商 ' + pIdx + '/' + providers.length;
+      await saveScheduleConfig(env, cfg);
     }
 
     await logBuf.flush(env);
@@ -1493,19 +1681,21 @@ async function executeScheduleRound(env, options = {}) {
   } catch (e) {
     logBuf.push('error', '巡检异常', e.message);
     await logBuf.flush(env);
-    cfg = await getScheduleConfig(env);
-    // 保留 cursor 以便下次续跑，但若无 cursor 则清 running
-    if (!cfg.cursor) {
-      cfg.running = false;
-    }
-    cfg.lastSummary = '执行异常: ' + e.message;
-    await saveScheduleConfig(env, cfg);
+    // 异常时尽量保留当前 cursor
+    try {
+      cfg.cursor = sanitizeCursorForKv(cursor);
+      cfg.stats = stats;
+      cfg.running = true;
+      cfg.lastSummary = '执行异常: ' + e.message;
+      await saveScheduleConfig(env, cfg);
+    } catch (_) { /* ignore */ }
     return {
       skipped: false,
       success: false,
       error: e.message,
-      needContinue: !!cfg.cursor,
-      config: cfg
+      needContinue: !!(cursor && (cursor.hostIds || cursor.providerIdx > 0)),
+      config: cfg,
+      continueCursor: cursor ? Object.assign(sanitizeCursorForKv(cursor) || {}, { stats: Object.assign({}, stats) }) : null
     };
   }
 }
@@ -1526,6 +1716,9 @@ async function finishScheduleRound(env, cfgIn, stats, logBuf, emptyProviders) {
   cfg.running = false;
   cfg.cursor = null;
   cfg.progress = null;
+  cfg.roundId = null;
+  cfg.claimToken = null;
+  cfg.yielded = false;
   cfg.stats = stats;
   cfg.lastRunAt = now.toISOString();
   cfg.lastSummary = summary;
@@ -1552,19 +1745,44 @@ async function finishScheduleRound(env, cfgIn, stats, logBuf, emptyProviders) {
   };
 }
 
-/** 后台自续跑：waitUntil 再请求自己，把剩余机器跑完 */
+/**
+ * 后台自续跑：waitUntil 再请求自己继续下一分片。
+ * body 携带 continueCursor 快照，不依赖 KV 最终一致。
+ * 每请求只挂 1 跳（下一跳自己再 waitUntil），避免 waitUntil 总时长超限。
+ * 关页后靠外部 cron 每分钟 /api/schedule/run 自动 resume。
+ */
 function scheduleContinueIfNeeded(context, request, result) {
   if (!result || !result.needContinue || !context.waitUntil) return;
+  // 已被其他 worker 占用时不要空转 waitUntil（等锁过期由 cron/前端再触发）
+  if (result.skipped && result.reason === 'already_running') return;
+  const hop = Math.max(0, parseInt(result.hop, 10) || 0);
+  if (hop >= SCHEDULE_CONTINUE_MAX_HOPS) return;
   try {
     const base = new URL(request.url);
     const contUrl = new URL(base.pathname, base.origin);
     contUrl.searchParams.set('continue', '1');
+    contUrl.searchParams.set('hop', String(hop + 1));
+    const bodyPayload = JSON.stringify({
+      cursor: result.continueCursor || null,
+      hop: hop + 1
+    });
     context.waitUntil(
-      fetch(contUrl.toString(), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Schedule-Continue': '1' },
-        body: '{}'
-      }).catch(err => console.warn('schedule continue fetch failed:', err))
+      (async () => {
+        // 稍等让本请求的 KV 写尽量可见；失败也不影响 body.cursor
+        await new Promise(r => setTimeout(r, 250));
+        try {
+          await fetch(contUrl.toString(), {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Schedule-Continue': '1'
+            },
+            body: bodyPayload
+          });
+        } catch (err) {
+          console.warn('schedule continue fetch failed:', err);
+        }
+      })()
     );
   } catch (e) {
     console.warn('scheduleContinueIfNeeded error:', e);
@@ -1616,6 +1834,9 @@ async function handleScheduleStart(context) {
     cfg.running = false;
     cfg.cursor = null;
     cfg.progress = null;
+    cfg.roundId = null;
+    cfg.claimToken = null;
+    cfg.yielded = false;
     await saveScheduleConfig(env, cfg);
     await appendScheduleLog(env, 'info', '定时已启动', '间隔 ' + intervalMin + ' 分钟，覆盖全部服务商全部机器');
 
@@ -1653,6 +1874,9 @@ async function handleScheduleStop(context) {
     cfg.running = false;
     cfg.cursor = null;
     cfg.progress = null;
+    cfg.roundId = null;
+    cfg.claimToken = null;
+    cfg.yielded = false;
     await saveScheduleConfig(env, cfg);
     await appendScheduleLog(env, 'info', '定时已停止');
     return jsonResponse({ success: true, msg: '服务端定时已停止', config: cfg });
@@ -1661,7 +1885,9 @@ async function handleScheduleStop(context) {
   }
 }
 
-/** GET|POST /api/schedule/run  ?force=1 立即执行  ?continue=1 分片续跑 */
+/** GET|POST /api/schedule/run  ?force=1 立即执行  ?continue=1 分片续跑  ?new=1 强制新一轮
+ *  Body 可选: { cursor, hop } — waitUntil 续跑时携带进度快照
+ */
 async function handleScheduleRun(context) {
   const { request, env } = context;
   if (!env.AUTH_KV) {
@@ -1670,9 +1896,26 @@ async function handleScheduleRun(context) {
   try {
     const url = new URL(request.url);
     const force = url.searchParams.get('force') === '1' || url.searchParams.get('force') === 'true';
-    const isContinue = url.searchParams.get('continue') === '1' || url.searchParams.get('continue') === 'true';
-    const result = await executeScheduleRound(env, { force, isContinue });
+    const forceNew = url.searchParams.get('new') === '1' || url.searchParams.get('new') === 'true';
+    let isContinue = url.searchParams.get('continue') === '1' || url.searchParams.get('continue') === 'true';
+    if (request.headers.get('X-Schedule-Continue') === '1') isContinue = true;
+    let hop = parseInt(url.searchParams.get('hop') || '0', 10) || 0;
+
+    let bodyCursor = null;
+    if (request.method === 'POST' || request.method === 'PUT') {
+      try {
+        const body = await request.json();
+        if (body && body.cursor && typeof body.cursor === 'object') {
+          bodyCursor = body.cursor;
+          isContinue = true;
+        }
+        if (body && body.hop != null) hop = parseInt(body.hop, 10) || hop;
+      } catch { /* empty / non-json body ok */ }
+    }
+
+    const result = await executeScheduleRound(env, { force, forceNew, isContinue, bodyCursor, hop });
     scheduleContinueIfNeeded(context, request, result);
+    // 响应里带上 continueCursor，方便前端盯梢时回传
     return jsonResponse({ success: true, ...result });
   } catch (error) {
     return jsonResponse({ success: false, error: error.message }, 500);
