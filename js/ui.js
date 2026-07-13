@@ -477,18 +477,8 @@ function initTheme() {
 
 let _themeAnimating = false;
 
-function toggleTheme(event) {
-    if (_themeAnimating) return;
-    const next = document.documentElement.classList.contains('dark') ? 'light' : 'dark';
-    const reveal = document.getElementById('themeReveal');
+function _themeOriginFromEvent(event) {
     const btn = document.getElementById('btnThemeToggle') || (event && event.currentTarget);
-
-    // 无遮罩元素时直接切换
-    if (!reveal) {
-        applyTheme(next);
-        return;
-    }
-
     let x = window.innerWidth / 2;
     let y = window.innerHeight / 2;
     if (event && typeof event.clientX === 'number' && event.clientX > 0) {
@@ -499,30 +489,38 @@ function toggleTheme(event) {
         x = r.left + r.width / 2;
         y = r.top + r.height / 2;
     }
+    return { x: x, y: y };
+}
 
-    reveal.style.setProperty('--tx', x + 'px');
-    reveal.style.setProperty('--ty', y + 'px');
-    reveal.className = 'theme-reveal active ' + (next === 'dark' ? 'revealing-dark' : 'revealing-light');
-    // 强制 reflow 后再开启动画
-    void reveal.offsetWidth;
-    reveal.classList.add('animating', 'expanded');
-    _themeAnimating = true;
+/**
+ * 主题圆形扩散：用 View Transitions 在真实页面内容上做 clip-path，
+ * 文字始终可见，黑白变化在内容层完成（不再用实色遮罩盖住文字）。
+ */
+function toggleTheme(event) {
+    if (_themeAnimating) return;
+    const next = document.documentElement.classList.contains('dark') ? 'light' : 'dark';
+    const origin = _themeOriginFromEvent(event);
+    const root = document.documentElement;
 
-    const done = function () {
+    root.style.setProperty('--theme-x', origin.x + 'px');
+    root.style.setProperty('--theme-y', origin.y + 'px');
+
+    // 不支持 View Transitions 时直接切换（无遮罩盖字）
+    if (typeof document.startViewTransition !== 'function') {
         applyTheme(next);
-        reveal.className = 'theme-reveal';
-        reveal.removeEventListener('transitionend', onEnd);
+        return;
+    }
+
+    _themeAnimating = true;
+    const transition = document.startViewTransition(function () {
+        applyTheme(next);
+    });
+
+    transition.finished.finally(function () {
         _themeAnimating = false;
-    };
-    const onEnd = function (e) {
-        if (e.propertyName && e.propertyName !== 'clip-path') return;
-        done();
-    };
-    reveal.addEventListener('transitionend', onEnd);
-    // 兜底：动画异常时也能结束
-    setTimeout(function () {
-        if (_themeAnimating) done();
-    }, 700);
+        root.style.removeProperty('--theme-x');
+        root.style.removeProperty('--theme-y');
+    });
 }
 
 // 立即挂到 window，保证 onclick 可用

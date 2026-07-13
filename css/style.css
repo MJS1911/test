@@ -34,8 +34,6 @@
     --status-off-bg: #fee2e2;
     --status-off-color: #991b1b;
     --muted-surface: #f1f5f9;
-    --theme-reveal-dark: #0f172a;
-    --theme-reveal-light: #f8fafc;
 }
 
 html.dark {
@@ -1205,31 +1203,37 @@ html.dark .theme-toggle-btn .theme-icon-moon {
     transform: rotate(90deg) scale(0.4);
 }
 
-/* 主题圆形扩散遮罩 */
+/* 主题圆形扩散：View Transitions 在真实内容上裁剪，文字始终可见 */
+::view-transition-old(root),
+::view-transition-new(root) {
+    animation: none;
+    mix-blend-mode: normal;
+}
+::view-transition-old(root) {
+    z-index: 1;
+}
+::view-transition-new(root) {
+    z-index: 9999;
+    animation: theme-circle-reveal 0.55s cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+@keyframes theme-circle-reveal {
+    from {
+        clip-path: circle(0% at var(--theme-x, 50%) var(--theme-y, 50%));
+    }
+    to {
+        clip-path: circle(150% at var(--theme-x, 50%) var(--theme-y, 50%));
+    }
+}
+/* 降低动态效果偏好时关闭圆形扩散 */
+@media (prefers-reduced-motion: reduce) {
+    ::view-transition-old(root),
+    ::view-transition-new(root) {
+        animation: none !important;
+    }
+}
+/* 旧遮罩节点保留兼容，默认隐藏 */
 .theme-reveal {
-    position: fixed;
-    inset: 0;
-    z-index: 99999;
-    pointer-events: none;
-    opacity: 0;
-    transition: none;
-}
-.theme-reveal.active {
-    opacity: 1;
-}
-.theme-reveal.revealing-dark {
-    background: var(--theme-reveal-dark);
-    clip-path: circle(0% at var(--tx, 50%) var(--ty, 50%));
-}
-.theme-reveal.revealing-light {
-    background: var(--theme-reveal-light);
-    clip-path: circle(0% at var(--tx, 50%) var(--ty, 50%));
-}
-.theme-reveal.animating {
-    transition: clip-path 0.55s cubic-bezier(0.4, 0, 0.2, 1);
-}
-.theme-reveal.expanded {
-    clip-path: circle(150% at var(--tx, 50%) var(--ty, 50%));
+    display: none !important;
 }
 
 /* ==================== 暗色模式补充 ==================== */
