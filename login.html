@@ -10,7 +10,7 @@
     <div class="login-container">
         <div class="login-card">
             <div class="login-logo">
-                <span class="login-logo-icon">🖥️</span>
+                <div class="login-logo-mark">HE</div>
                 <h1>Herning Engineering</h1>
                 <p class="login-subtitle">多平台服务器管理面板</p>
             </div>
@@ -18,17 +18,17 @@
             <!-- 首次初始化 -->
             <div id="initSection" style="display:none;">
                 <div class="alert alert-info">
-                    <p>🔐 <strong>首次访问</strong></p>
-                    <p>请设置本站后台管理密码，用于登录管理面板。</p>
+                    <p><strong>首次访问</strong></p>
+                    <p>请设置本站后台管理密码。</p>
                     <p class="text-muted" style="font-size:0.8rem;margin-top:4px;">此密码仅用于进入管理网站，与魔方服务商账号无关。</p>
                 </div>
                 <div class="form-group">
-                    <label for="initPassword">设置管理密码</label>
-                    <input type="password" id="initPassword" placeholder="请输入管理密码（至少6位）" autocomplete="new-password">
+                    <label for="initPassword">请输入密码：</label>
+                    <input type="password" id="initPassword" placeholder="至少 6 位" autocomplete="new-password">
                 </div>
                 <div class="form-group">
-                    <label for="initConfirmPassword">确认管理密码</label>
-                    <input type="password" id="initConfirmPassword" placeholder="请再次输入管理密码" autocomplete="new-password">
+                    <label for="initConfirmPassword">请确认密码：</label>
+                    <input type="password" id="initConfirmPassword" placeholder="再次输入密码" autocomplete="new-password">
                 </div>
                 <div class="login-msg" id="initMsg"></div>
                 <button class="btn btn-primary btn-block" id="btnInit" onclick="initAdminPassword()">设置密码并登录</button>
@@ -36,16 +36,16 @@
 
             <!-- 正常登录 -->
             <div id="loginSection">
-                <div class="form-group">
-                    <label for="loginPassword">管理员密码</label>
-                    <input type="password" id="loginPassword" placeholder="请输入站点的管理密码" autocomplete="current-password">
+                <div class="form-group login-password-group">
+                    <label for="loginPassword">请输入密码：</label>
+                    <input type="password" id="loginPassword" placeholder="请输入管理密码" autocomplete="current-password" autofocus>
                 </div>
                 <div class="login-msg" id="loginMsg"></div>
-                <button class="btn btn-primary btn-block" id="btnLogin" onclick="doSiteLogin()">🔓 登录</button>
+                <button class="btn btn-primary btn-block" id="btnLogin" onclick="doSiteLogin()">登录</button>
             </div>
         </div>
         <div class="login-footer">
-            <p>🔐 多服务商管理面板 · 安全登录</p>
+            <p>多服务商管理面板 · 安全登录</p>
         </div>
     </div>
 
