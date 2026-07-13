@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>魔方财务自动化开机管理平台</title>
-    <link rel="stylesheet" href="css/style.css?v=20260714d">
+    <link rel="stylesheet" href="css/style.css?v=20260714e">
     <script>
     (function () {
         try {
@@ -92,8 +92,8 @@
                     <button class="btn btn-outline btn-sm" onclick="refreshAllStatus()">刷新全部状态</button>
                 </div>
                 <div class="schedule-ops" id="scheduleOps">
-                    <h3 class="schedule-ops-title">⏱ 定时操作</h3>
-                    <p class="schedule-ops-desc">按间隔检查本服务商全部服务器；非运行中优先硬重启，失败则重启。</p>
+                    <h3 class="schedule-ops-title">⏱ 定时操作（服务端）</h3>
+                    <p class="schedule-ops-desc">在 Cloudflare 服务端长效运行：按间隔巡检<strong>全部服务商</strong>全部服务器；非运行中优先硬重启，失败则重启。关闭网页、切换服务商均不停。</p>
                     <div class="form-group schedule-interval-group">
                         <label for="scheduleInterval">检查间隔（分钟）</label>
                         <input type="number" id="scheduleInterval" min="1" max="1440" value="5" step="1">
@@ -101,8 +101,10 @@
                     <div class="batch-buttons">
                         <button type="button" class="btn btn-success btn-sm" id="btnScheduleStart" onclick="startScheduledOps()">启动定时</button>
                         <button type="button" class="btn btn-outline btn-sm" id="btnScheduleStop" onclick="stopScheduledOps()" disabled>停止</button>
+                        <button type="button" class="btn btn-outline btn-sm" id="btnScheduleRunNow" onclick="runScheduledCheck()" title="立即执行一轮">立即巡检</button>
                     </div>
-                    <div class="schedule-status" id="scheduleStatus">未启动</div>
+                    <div class="schedule-status" id="scheduleStatus">加载中…</div>
+                    <p class="schedule-ops-hint" style="font-size:0.75rem;color:var(--text-muted);margin-top:8px;line-height:1.4;">需配置定时触发：用 cron-job.org 等每分钟访问 <code>/api/schedule/run</code>（未到间隔会自动跳过）。打开本页时也会辅助触发。</p>
                 </div>
                 <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
                     <button class="btn btn-outline btn-sm btn-block" onclick="openChangePasswordDialog()">🔑 修改管理密码</button>
@@ -270,10 +272,10 @@
         <div class="log-content" id="logContent"></div>
     </div>
 
-    <script src="js/api.js?v=20260714d"></script>
-    <script src="js/adminAuth.js?v=20260714d"></script>
-    <script src="js/ui.js?v=20260714d"></script>
-    <script src="js/operations.js?v=20260714d"></script>
+    <script src="js/api.js?v=20260714e"></script>
+    <script src="js/adminAuth.js?v=20260714e"></script>
+    <script src="js/ui.js?v=20260714e"></script>
+    <script src="js/operations.js?v=20260714e"></script>
     <script>
     // ==================== 服务商标签栏管理 ====================
 

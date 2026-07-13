@@ -15,6 +15,11 @@
  * 路由: /api/provider/delete -> 删除服务商
  * 路由: /api/provider/active -> 设置活跃服务商
  * 路由: /api/provider/auto-login -> 自动登录服务商（服务端代理登录获取 JWT）
+ * 路由: /api/schedule/status -> 获取服务端定时任务状态
+ * 路由: /api/schedule/start  -> 启动服务端定时（KV 持久化，关网页不停）
+ * 路由: /api/schedule/stop   -> 停止服务端定时
+ * 路由: /api/schedule/run    -> 执行一轮巡检（Cron/外部定时器调用；未到期则跳过）
+ * 路由: /api/schedule/logs   -> 最近执行日志
  * 
  * 部署后可用地址: https://<your-project>.pages.dev/api/*
  * 
@@ -80,6 +85,23 @@ export async function onRequest(context) {
   }
   if (path === '/provider/auto-login' || path === '/provider/auto-login/') {
     return handleProviderAutoLogin(context);
+  }
+
+  // ========== /api/schedule/* 路由：服务端长效定时巡检 ==========
+  if (path === '/schedule/status' || path === '/schedule/status/') {
+    return handleScheduleStatus(context);
+  }
+  if (path === '/schedule/start' || path === '/schedule/start/') {
+    return handleScheduleStart(context);
+  }
+  if (path === '/schedule/stop' || path === '/schedule/stop/') {
+    return handleScheduleStop(context);
+  }
+  if (path === '/schedule/run' || path === '/schedule/run/') {
+    return handleScheduleRun(context);
+  }
+  if (path === '/schedule/logs' || path === '/schedule/logs/') {
+    return handleScheduleLogs(context);
   }
   
   // ========== 常规 API 代理转发 ==========
@@ -889,6 +911,488 @@ async function handleProviderAutoLogin(context) {
       status: 500,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     });
+  }
+}
+
+// ==================== 服务端定时巡检（KV 持久化，关网页不停） ====================
+// KV keys:
+//   schedule_config  - { enabled, intervalMin, lastRunAt, nextRunAt, running, lastSummary, updatedAt }
+//   schedule_logs    - [{ ts, level, msg, detail? }, ...] 最多 100 条
+//
+// 触发方式（任选其一，推荐 1）：
+// 1. Cloudflare Cron Triggers 每分钟打 GET/POST /api/schedule/run（内部按 intervalMin 判断是否执行）
+// 2. 外部 cron（如 cron-job.org）每分钟请求 https://你的站点.pages.dev/api/schedule/run
+// 3. 前端打开时也会轮询 status；手动可 POST /api/schedule/run?force=1 立即跑一轮
+
+const SCHEDULE_CONFIG_KEY = 'schedule_config';
+const SCHEDULE_LOGS_KEY = 'schedule_logs';
+const SCHEDULE_MAX_LOGS = 100;
+const SCHEDULE_DEFAULT_INTERVAL = 5;
+const SCHEDULE_MIN_INTERVAL = 1;
+const SCHEDULE_MAX_INTERVAL = 1440;
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+  });
+}
+
+function defaultScheduleConfig() {
+  return {
+    enabled: false,
+    intervalMin: SCHEDULE_DEFAULT_INTERVAL,
+    lastRunAt: null,
+    nextRunAt: null,
+    running: false,
+    lastSummary: null,
+    updatedAt: null
+  };
+}
+
+async function getScheduleConfig(env) {
+  if (!env.AUTH_KV) return defaultScheduleConfig();
+  try {
+    const raw = await env.AUTH_KV.get(SCHEDULE_CONFIG_KEY);
+    if (!raw) return defaultScheduleConfig();
+    return Object.assign(defaultScheduleConfig(), JSON.parse(raw));
+  } catch {
+    return defaultScheduleConfig();
+  }
+}
+
+async function saveScheduleConfig(env, cfg) {
+  if (!env.AUTH_KV) throw new Error('KV 存储未配置');
+  cfg.updatedAt = new Date().toISOString();
+  await env.AUTH_KV.put(SCHEDULE_CONFIG_KEY, JSON.stringify(cfg));
+  return cfg;
+}
+
+async function getScheduleLogs(env) {
+  if (!env.AUTH_KV) return [];
+  try {
+    const raw = await env.AUTH_KV.get(SCHEDULE_LOGS_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+async function appendScheduleLog(env, level, msg, detail) {
+  if (!env.AUTH_KV) return;
+  try {
+    const logs = await getScheduleLogs(env);
+    logs.unshift({
+      ts: new Date().toISOString(),
+      level: level || 'info',
+      msg: String(msg || ''),
+      detail: detail != null ? String(detail).substring(0, 500) : undefined
+    });
+    while (logs.length > SCHEDULE_MAX_LOGS) logs.pop();
+    await env.AUTH_KV.put(SCHEDULE_LOGS_KEY, JSON.stringify(logs));
+  } catch (e) {
+    console.warn('appendScheduleLog failed:', e);
+  }
+}
+
+/** 服务端登录服务商，返回 jwt 或 null */
+async function serverLoginProvider(provider) {
+  if (!provider || !provider.account || !provider.apiKey || !provider.url) {
+    return { ok: false, error: '服务商缺少凭证或 URL' };
+  }
+  let baseUrl = provider.url;
+  if (!baseUrl.endsWith('/')) baseUrl += '/';
+  const loginUrl = new URL('login_api', baseUrl).toString();
+
+  const formBody = new URLSearchParams();
+  formBody.append('account', provider.account);
+  formBody.append('password', provider.apiKey);
+
+  const headers = new Headers();
+  headers.set('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
+  headers.set('Accept', '*/*');
+  headers.set('Accept-Language', 'zh-CN,zh;q=0.8,en;q=0.7');
+  headers.set('X-Requested-With', 'XMLHttpRequest');
+  headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  const targetOrigin = new URL(baseUrl).origin;
+  headers.set('Origin', targetOrigin);
+  headers.set('Referer', targetOrigin + '/');
+
+  const loginResp = await fetch(loginUrl, {
+    method: 'POST',
+    headers,
+    body: formBody.toString(),
+    redirect: 'follow'
+  });
+  const loginData = await loginResp.json();
+
+  let jwt = null;
+  if (loginData.status === 200) {
+    if (loginData.info && loginData.info.jwt) jwt = loginData.info.jwt;
+    else if (loginData.jwt) jwt = loginData.jwt;
+    else if (loginData.data && loginData.data.jwt) jwt = loginData.data.jwt;
+  }
+  if (!jwt) {
+    const errMsg = loginData.msg || loginData.info?.msg || loginData.message || '登录失败';
+    return { ok: false, error: errMsg };
+  }
+  return { ok: true, jwt, baseUrl, origin: targetOrigin };
+}
+
+/** 带 JWT 请求魔方 API（v1 或 provision） */
+async function serverApiRequest(providerBase, jwt, relativePath, method, bodyStr, isProvision) {
+  let baseUrl = providerBase;
+  if (!baseUrl.endsWith('/')) baseUrl += '/';
+  const origin = new URL(baseUrl).origin;
+  const targetBase = isProvision ? (origin + '/') : baseUrl;
+  const rel = String(relativePath || '').replace(/^\//, '');
+  const targetUrl = new URL(rel, targetBase).toString();
+
+  const headers = new Headers();
+  headers.set('Accept', '*/*');
+  headers.set('Accept-Language', 'zh-CN,zh;q=0.8,en;q=0.7');
+  headers.set('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
+  headers.set('X-Requested-With', 'XMLHttpRequest');
+  headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  headers.set('Origin', origin);
+  headers.set('Referer', origin + '/');
+  headers.set('Authorization', 'Bearer ' + jwt);
+  headers.set('Cookie', 'ZJMF_8F073A284ADDCA6A=' + jwt);
+
+  const resp = await fetch(targetUrl, {
+    method: method || 'GET',
+    headers,
+    body: method !== 'GET' && method !== 'HEAD' ? bodyStr : undefined,
+    redirect: 'follow'
+  });
+  const contentType = resp.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    return await resp.json();
+  }
+  const text = await resp.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { status: resp.status, raw: text };
+  }
+}
+
+function isHostRunningStatus(data) {
+  if (!data) return false;
+  const s = String(data.status || '').toLowerCase();
+  return s === 'on' || s === 'running' || s === 'online';
+}
+
+async function serverRecoverHost(providerBase, jwt, hostId) {
+  // 优先硬重启
+  const hardParams = new URLSearchParams();
+  hardParams.append('id', String(hostId));
+  hardParams.append('func', 'hard_reboot');
+  try {
+    const hard = await serverApiRequest(providerBase, jwt, 'provision/default', 'POST', hardParams.toString(), true);
+    if (hard && hard.status === 200 && !(hard.data && hard.data._second_verify)) {
+      return { success: true, action: 'hard_reboot', msg: hard.msg || '硬重启成功' };
+    }
+  } catch (e) {
+    // fall through
+  }
+  // 兜底普通重启
+  const softParams = new URLSearchParams();
+  softParams.append('id', String(hostId));
+  softParams.append('func', 'reboot');
+  try {
+    const soft = await serverApiRequest(providerBase, jwt, 'provision/default', 'POST', softParams.toString(), true);
+    if (soft && soft.status === 200 && !(soft.data && soft.data._second_verify)) {
+      return { success: true, action: 'reboot', msg: soft.msg || '重启成功' };
+    }
+    return {
+      success: false,
+      action: 'reboot',
+      error: (soft && (soft.msg || soft.info)) || '重启失败'
+    };
+  } catch (e) {
+    return { success: false, action: 'reboot', error: e.message };
+  }
+}
+
+/**
+ * 执行一轮：遍历所有服务商 → 登录 → 拉 hosts → 查 status → 非运行则 hard_reboot→reboot
+ */
+async function executeScheduleRound(env, options = {}) {
+  const force = !!options.force;
+  let cfg = await getScheduleConfig(env);
+
+  if (!cfg.enabled && !force) {
+    return { skipped: true, reason: 'disabled', config: cfg };
+  }
+
+  // 未到下次执行时间则跳过（force 除外）
+  if (!force && cfg.nextRunAt) {
+    const next = new Date(cfg.nextRunAt).getTime();
+    if (!isNaN(next) && Date.now() < next - 2000) {
+      return { skipped: true, reason: 'not_due', config: cfg, nextRunAt: cfg.nextRunAt };
+    }
+  }
+
+  // 防并发：若标记 running 且 10 分钟内，跳过
+  if (cfg.running && cfg.updatedAt) {
+    const updated = new Date(cfg.updatedAt).getTime();
+    if (!isNaN(updated) && Date.now() - updated < 10 * 60 * 1000) {
+      return { skipped: true, reason: 'already_running', config: cfg };
+    }
+  }
+
+  cfg.running = true;
+  await saveScheduleConfig(env, cfg);
+  await appendScheduleLog(env, 'info', '开始巡检', 'interval=' + cfg.intervalMin + 'min');
+
+  const providers = await getProviders(env);
+  let totalChecked = 0, totalRunning = 0, totalRecovered = 0, totalFailed = 0;
+  const providerResults = [];
+
+  try {
+    if (!providers || providers.length === 0) {
+      await appendScheduleLog(env, 'warning', '无服务商，跳过');
+    }
+
+    for (const provider of providers || []) {
+      const pname = provider.name || provider.id || 'unknown';
+      const pResult = { id: provider.id, name: pname, checked: 0, running: 0, recovered: 0, failed: 0, error: null };
+
+      try {
+        if (!provider.account || !provider.apiKey) {
+          pResult.error = '缺少登录凭证';
+          await appendScheduleLog(env, 'warning', '[' + pname + '] 缺少凭证，跳过');
+          providerResults.push(pResult);
+          continue;
+        }
+
+        const login = await serverLoginProvider(provider);
+        if (!login.ok) {
+          pResult.error = login.error;
+          totalFailed++;
+          await appendScheduleLog(env, 'error', '[' + pname + '] 登录失败', login.error);
+          providerResults.push(pResult);
+          continue;
+        }
+
+        // 拉服务器列表
+        const hostsResp = await serverApiRequest(login.baseUrl, login.jwt, 'hosts?page=1&limit=200', 'GET', null, false);
+        if (!hostsResp || hostsResp.status !== 200) {
+          pResult.error = (hostsResp && (hostsResp.msg || hostsResp.info)) || '获取服务器列表失败';
+          totalFailed++;
+          await appendScheduleLog(env, 'error', '[' + pname + '] 获取列表失败', pResult.error);
+          providerResults.push(pResult);
+          continue;
+        }
+
+        const hosts = (hostsResp.data && hostsResp.data.host) || [];
+        await appendScheduleLog(env, 'info', '[' + pname + '] 开始检查', '共 ' + hosts.length + ' 台');
+
+        for (const host of hosts) {
+          const hostId = host.id;
+          if (!hostId) continue;
+          try {
+            const stParams = new URLSearchParams();
+            stParams.append('id', String(hostId));
+            stParams.append('func', 'status');
+            const st = await serverApiRequest(login.baseUrl, login.jwt, 'provision/default', 'POST', stParams.toString(), true);
+
+            if (st && st.status === 200) {
+              pResult.checked++;
+              totalChecked++;
+              const data = st.data || {};
+              if (isHostRunningStatus(data)) {
+                pResult.running++;
+                totalRunning++;
+              } else {
+                const des = data.des || data.status || '非运行中';
+                await appendScheduleLog(env, 'warning', '[' + pname + '] #' + hostId + ' 非运行中 (' + des + ')，尝试恢复');
+                const rec = await serverRecoverHost(login.baseUrl, login.jwt, hostId);
+                if (rec.success) {
+                  pResult.recovered++;
+                  totalRecovered++;
+                  await appendScheduleLog(env, 'success', '[' + pname + '] #' + hostId + ' ' + rec.action + ' 成功', rec.msg);
+                } else {
+                  pResult.failed++;
+                  totalFailed++;
+                  await appendScheduleLog(env, 'error', '[' + pname + '] #' + hostId + ' 恢复失败', rec.error);
+                }
+              }
+            } else {
+              pResult.failed++;
+              totalFailed++;
+              const err = (st && (st.msg || st.info)) || '查状态失败';
+              await appendScheduleLog(env, 'error', '[' + pname + '] #' + hostId + ' 查状态失败', err);
+            }
+          } catch (hostErr) {
+            pResult.failed++;
+            totalFailed++;
+            await appendScheduleLog(env, 'error', '[' + pname + '] #' + hostId + ' 异常', hostErr.message);
+          }
+          // 轻微间隔，避免打爆目标站
+          await new Promise(r => setTimeout(r, 200));
+        }
+      } catch (pErr) {
+        pResult.error = pErr.message;
+        totalFailed++;
+        await appendScheduleLog(env, 'error', '[' + pname + '] 异常', pErr.message);
+      }
+      providerResults.push(pResult);
+    }
+
+    const summary = '检查 ' + totalChecked + ' · 运行中 ' + totalRunning + ' · 已恢复 ' + totalRecovered + ' · 失败 ' + totalFailed;
+    const now = new Date();
+    const intervalMin = Math.max(SCHEDULE_MIN_INTERVAL, Math.min(SCHEDULE_MAX_INTERVAL, cfg.intervalMin || SCHEDULE_DEFAULT_INTERVAL));
+    cfg = await getScheduleConfig(env); // 重新读，避免覆盖用户中途 stop
+    cfg.running = false;
+    cfg.lastRunAt = now.toISOString();
+    cfg.lastSummary = summary;
+    if (cfg.enabled) {
+      cfg.nextRunAt = new Date(now.getTime() + intervalMin * 60 * 1000).toISOString();
+    } else {
+      cfg.nextRunAt = null;
+    }
+    await saveScheduleConfig(env, cfg);
+    await appendScheduleLog(env, 'info', '本轮完成', summary);
+
+    return {
+      skipped: false,
+      success: true,
+      summary,
+      stats: { checked: totalChecked, running: totalRunning, recovered: totalRecovered, failed: totalFailed },
+      providers: providerResults,
+      config: cfg
+    };
+  } catch (e) {
+    cfg = await getScheduleConfig(env);
+    cfg.running = false;
+    cfg.lastSummary = '执行异常: ' + e.message;
+    await saveScheduleConfig(env, cfg);
+    await appendScheduleLog(env, 'error', '巡检异常', e.message);
+    return { skipped: false, success: false, error: e.message, config: cfg };
+  }
+}
+
+/** GET /api/schedule/status */
+async function handleScheduleStatus(context) {
+  const { env } = context;
+  if (!env.AUTH_KV) {
+    return jsonResponse({ success: false, error: 'KV 存储未配置' }, 500);
+  }
+  try {
+    const config = await getScheduleConfig(env);
+    const logs = await getScheduleLogs(env);
+    return jsonResponse({ success: true, config, logs: logs.slice(0, 20) });
+  } catch (error) {
+    return jsonResponse({ success: false, error: error.message }, 500);
+  }
+}
+
+/** POST /api/schedule/start  Body: { intervalMin?: number } */
+async function handleScheduleStart(context) {
+  const { request, env } = context;
+  if (!env.AUTH_KV) {
+    return jsonResponse({ success: false, error: 'KV 存储未配置' }, 500);
+  }
+  try {
+    let intervalMin = SCHEDULE_DEFAULT_INTERVAL;
+    try {
+      const body = await request.json();
+      if (body && body.intervalMin != null) {
+        intervalMin = parseInt(body.intervalMin, 10);
+      }
+    } catch { /* empty body ok */ }
+
+    if (!intervalMin || isNaN(intervalMin) || intervalMin < SCHEDULE_MIN_INTERVAL) intervalMin = SCHEDULE_MIN_INTERVAL;
+    if (intervalMin > SCHEDULE_MAX_INTERVAL) intervalMin = SCHEDULE_MAX_INTERVAL;
+
+    const providers = await getProviders(env);
+    if (!providers || providers.length === 0) {
+      return jsonResponse({ success: false, error: '请先添加至少一个服务商' }, 400);
+    }
+
+    let cfg = await getScheduleConfig(env);
+    cfg.enabled = true;
+    cfg.intervalMin = intervalMin;
+    cfg.nextRunAt = new Date().toISOString(); // 立即到期，下次 run 会执行
+    cfg.running = false;
+    await saveScheduleConfig(env, cfg);
+    await appendScheduleLog(env, 'info', '定时已启动', '间隔 ' + intervalMin + ' 分钟，覆盖全部服务商');
+
+    // 启动时立即跑一轮（waitUntil 若可用则后台，否则同步）
+    let runResult = null;
+    try {
+      if (context.waitUntil) {
+        context.waitUntil(executeScheduleRound(env, { force: true }));
+        runResult = { deferred: true };
+      } else {
+        runResult = await executeScheduleRound(env, { force: true });
+      }
+    } catch (runErr) {
+      console.warn('schedule start immediate run error:', runErr);
+    }
+
+    cfg = await getScheduleConfig(env);
+    return jsonResponse({
+      success: true,
+      msg: '服务端定时已启动，关闭网页后仍会按间隔巡检全部服务商',
+      config: cfg,
+      run: runResult
+    });
+  } catch (error) {
+    return jsonResponse({ success: false, error: error.message }, 500);
+  }
+}
+
+/** POST /api/schedule/stop */
+async function handleScheduleStop(context) {
+  const { env } = context;
+  if (!env.AUTH_KV) {
+    return jsonResponse({ success: false, error: 'KV 存储未配置' }, 500);
+  }
+  try {
+    let cfg = await getScheduleConfig(env);
+    cfg.enabled = false;
+    cfg.nextRunAt = null;
+    cfg.running = false;
+    await saveScheduleConfig(env, cfg);
+    await appendScheduleLog(env, 'info', '定时已停止');
+    return jsonResponse({ success: true, msg: '服务端定时已停止', config: cfg });
+  } catch (error) {
+    return jsonResponse({ success: false, error: error.message }, 500);
+  }
+}
+
+/** GET|POST /api/schedule/run  ?force=1 立即执行 */
+async function handleScheduleRun(context) {
+  const { request, env } = context;
+  if (!env.AUTH_KV) {
+    return jsonResponse({ success: false, error: 'KV 存储未配置' }, 500);
+  }
+  try {
+    const url = new URL(request.url);
+    const force = url.searchParams.get('force') === '1' || url.searchParams.get('force') === 'true';
+    const result = await executeScheduleRound(env, { force });
+    return jsonResponse({ success: true, ...result });
+  } catch (error) {
+    return jsonResponse({ success: false, error: error.message }, 500);
+  }
+}
+
+/** GET /api/schedule/logs */
+async function handleScheduleLogs(context) {
+  const { env } = context;
+  if (!env.AUTH_KV) {
+    return jsonResponse({ success: false, error: 'KV 存储未配置' }, 500);
+  }
+  try {
+    const logs = await getScheduleLogs(env);
+    return jsonResponse({ success: true, logs });
+  } catch (error) {
+    return jsonResponse({ success: false, error: error.message }, 500);
   }
 }
 
