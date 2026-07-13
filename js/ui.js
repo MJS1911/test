@@ -361,10 +361,162 @@ function clearLogs() {
     if (logContent) logContent.innerHTML = '';
 }
 
+function openLogPanel() {
+    const panel = document.getElementById('logPanel');
+    if (!panel) return;
+    panel.style.display = 'flex';
+    panel.classList.add('open');
+    initLogPanelDrag();
+}
+
+function closeLogPanel() {
+    const panel = document.getElementById('logPanel');
+    if (!panel) return;
+    panel.classList.remove('open');
+    panel.style.display = 'none';
+}
+
 function toggleLogPanel() {
     const panel = document.getElementById('logPanel');
-    if (panel) panel.classList.toggle('collapsed');
+    if (!panel) return;
+    if (panel.classList.contains('open') || panel.style.display === 'flex') {
+        closeLogPanel();
+    } else {
+        openLogPanel();
+    }
 }
+
+/** 日志浮窗拖动（标题栏拖拽） */
+let _logDragBound = false;
+function initLogPanelDrag() {
+    if (_logDragBound) return;
+    const panel = document.getElementById('logPanel');
+    const header = document.getElementById('logHeader');
+    if (!panel || !header) return;
+    _logDragBound = true;
+
+    let dragging = false;
+    let startX = 0, startY = 0, origLeft = 0, origTop = 0;
+
+    header.addEventListener('mousedown', function (e) {
+        if (e.button !== 0) return;
+        if (e.target.closest('button')) return;
+        dragging = true;
+        const rect = panel.getBoundingClientRect();
+        startX = e.clientX;
+        startY = e.clientY;
+        origLeft = rect.left;
+        origTop = rect.top;
+        panel.style.right = 'auto';
+        panel.style.bottom = 'auto';
+        panel.style.left = origLeft + 'px';
+        panel.style.top = origTop + 'px';
+        e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', function (e) {
+        if (!dragging) return;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        let left = origLeft + dx;
+        let top = origTop + dy;
+        const maxL = window.innerWidth - panel.offsetWidth;
+        const maxT = window.innerHeight - panel.offsetHeight;
+        left = Math.max(0, Math.min(left, maxL));
+        top = Math.max(0, Math.min(top, maxT));
+        panel.style.left = left + 'px';
+        panel.style.top = top + 'px';
+    });
+
+    document.addEventListener('mouseup', function () {
+        dragging = false;
+    });
+}
+
+// ==================== 主题切换（圆形扩散） ====================
+
+const THEME_KEY = 'mofang_theme';
+
+function getPreferredTheme() {
+    try {
+        const saved = localStorage.getItem(THEME_KEY);
+        if (saved === 'dark' || saved === 'light') return saved;
+    } catch (e) { /* ignore */ }
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        return 'dark';
+    }
+    return 'light';
+}
+
+function applyTheme(theme, skipStore) {
+    const isDark = theme === 'dark';
+    document.documentElement.classList.toggle('dark', isDark);
+    if (!skipStore) {
+        try { localStorage.setItem(THEME_KEY, theme); } catch (e) { /* ignore */ }
+    }
+    const btn = document.getElementById('btnThemeToggle');
+    if (btn) {
+        btn.title = isDark ? '切换为白天模式' : '切换为夜间模式';
+        btn.setAttribute('aria-label', btn.title);
+    }
+}
+
+function initTheme() {
+    applyTheme(getPreferredTheme(), true);
+}
+
+let _themeAnimating = false;
+
+function toggleTheme(event) {
+    if (_themeAnimating) return;
+    const next = document.documentElement.classList.contains('dark') ? 'light' : 'dark';
+    const reveal = document.getElementById('themeReveal');
+    const btn = document.getElementById('btnThemeToggle') || (event && event.currentTarget);
+
+    // 无遮罩元素时直接切换
+    if (!reveal) {
+        applyTheme(next);
+        return;
+    }
+
+    let x = window.innerWidth / 2;
+    let y = window.innerHeight / 2;
+    if (event && typeof event.clientX === 'number' && event.clientX > 0) {
+        x = event.clientX;
+        y = event.clientY;
+    } else if (btn) {
+        const r = btn.getBoundingClientRect();
+        x = r.left + r.width / 2;
+        y = r.top + r.height / 2;
+    }
+
+    reveal.style.setProperty('--tx', x + 'px');
+    reveal.style.setProperty('--ty', y + 'px');
+    reveal.className = 'theme-reveal active ' + (next === 'dark' ? 'revealing-dark' : 'revealing-light');
+    // 强制 reflow 后再开启动画
+    void reveal.offsetWidth;
+    reveal.classList.add('animating', 'expanded');
+    _themeAnimating = true;
+
+    const done = function () {
+        applyTheme(next);
+        reveal.className = 'theme-reveal';
+        reveal.removeEventListener('transitionend', onEnd);
+        _themeAnimating = false;
+    };
+    const onEnd = function (e) {
+        if (e.propertyName && e.propertyName !== 'clip-path') return;
+        done();
+    };
+    reveal.addEventListener('transitionend', onEnd);
+    // 兜底：动画异常时也能结束
+    setTimeout(function () {
+        if (_themeAnimating) done();
+    }, 700);
+}
+
+// 尽早应用主题，减少闪烁
+initTheme();
 
 // 监听 api-log 事件，渲染到日志窗口
 window.addEventListener('api-log', function(e) {
