@@ -226,14 +226,14 @@ function renderServerTable(hosts) {
         const billingcycle = host.billingcycle || '';
 
         html += '<tr data-host-id="' + id + '">';
-        html += '<td><strong>' + id + '</strong></td>';
-        html += '<td>' + escapeHtml(productName) + '</td>';
-        html += '<td>' + escapeHtml(domain) + '</td>';
-        html += '<td><code>' + escapeHtml(dedicatedip) + '</code></td>';
-        html += '<td>' + getDomainStatusBadge(domainstatus) + '</td>';
-        html += '<td>' + nextduedate + '</td>';
-        html += '<td>' + amount + (billingcycle ? ' / ' + billingcycle : '') + '</td>';
-        html += '<td class="action-cell">' + renderActionButtons(id) + '</td>';
+        html += '<td data-label="ID"><strong>' + id + '</strong></td>';
+        html += '<td data-label="产品名称">' + escapeHtml(productName) + '</td>';
+        html += '<td data-label="域名/IP">' + escapeHtml(domain) + '</td>';
+        html += '<td data-label="主IP"><code>' + escapeHtml(dedicatedip) + '</code></td>';
+        html += '<td data-label="状态">' + getDomainStatusBadge(domainstatus) + '</td>';
+        html += '<td data-label="到期时间">' + nextduedate + '</td>';
+        html += '<td data-label="金额">' + amount + (billingcycle ? ' / ' + billingcycle : '') + '</td>';
+        html += '<td class="action-cell" data-label="操作">' + renderActionButtons(id) + '</td>';
         html += '</tr>';
     });
 
